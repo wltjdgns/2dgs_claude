@@ -94,7 +94,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
     
-    rendered_image, radii, allmap = rasterizer(
+    # Pack PBR attributes as feature channels for alpha-compositing
+    # get_basecolor/get_roughness are already sigmoid-activated → [0, 1]
+    pbr_features = None
+    if hasattr(pc, 'get_basecolor') and hasattr(pc, 'get_roughness'):
+        pbr_features = torch.cat([pc.get_basecolor, pc.get_roughness], dim=-1)  # (N, 4)
+
+    rendered_image, radii, allmap, out_features = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -102,9 +108,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacities = opacity,
         scales = scales,
         rotations = rotations,
-        cov3D_precomp = cov3D_precomp
+        cov3D_precomp = cov3D_precomp,
+        features = pbr_features,
     )
-    
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     rets =  {"render": rendered_image,
@@ -154,5 +161,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
     })
+
+    # PBR feature maps from alpha-composited feature channels
+    if pbr_features is not None and out_features.shape[0] >= 4:
+        rets['albedomap'] = out_features[0:3]    # (3, H, W) basecolor
+        rets['roughnessmap'] = out_features[3:4]  # (1, H, W) roughness
 
     return rets

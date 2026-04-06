@@ -10,6 +10,7 @@
 #
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
@@ -50,6 +51,9 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._basecolor = torch.empty(0)  # (N, 3) - Albedo [0,1] via sigmoid
+        self._roughness = torch.empty(0)  # (N, 1) - [0,1] via sigmoid
+        self._metallic  = torch.empty(0)  # (N, 1) - [0,1] via sigmoid
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -67,25 +71,31 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self._basecolor,
+            self._roughness,
+            self._metallic,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self._basecolor,
+        self._roughness,
+        self._metallic,
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
+        opt_dict,
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -113,7 +123,25 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
+
+    @property
+    def get_basecolor(self):
+        return torch.sigmoid(self._basecolor)
+
+    @property
+    def get_roughness(self):
+        return torch.sigmoid(self._roughness)
+
+    @property
+    def get_metallic(self):
+        return torch.sigmoid(self._metallic)
+
+    @property
+    def normal(self):
+        """2DGS surfel normal: third column of rotation matrix (perpendicular to splat plane)."""
+        R = build_rotation(self._rotation)  # (N, 3, 3)
+        return F.normalize(R[:, :, 2], dim=-1)
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_xyz, self.get_scaling, scaling_modifier, self._rotation)
 
@@ -137,12 +165,21 @@ class GaussianModel:
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        N = fused_point_cloud.shape[0]
+        fused_color_rgb = torch.tensor(np.asarray(pcd.colors)).float().cuda()
+        basecolor_init = torch.logit(fused_color_rgb.clamp(0.01, 0.99))  # logit = inverse sigmoid
+        roughness_init = torch.zeros((N, 1), device="cuda")              # sigmoid(0) = 0.5
+        metallic_init  = torch.ones((N, 1), device="cuda") * (-2.2)     # sigmoid(-2.2) ≈ 0.1
+
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._basecolor = nn.Parameter(basecolor_init.requires_grad_(True))
+        self._roughness = nn.Parameter(roughness_init.requires_grad_(True))
+        self._metallic  = nn.Parameter(metallic_init.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -156,7 +193,10 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': [self._basecolor], 'lr': training_args.feature_lr, "name": "basecolor"},
+            {'params': [self._roughness], 'lr': training_args.feature_lr * 0.5, "name": "roughness"},
+            {'params': [self._metallic],  'lr': training_args.feature_lr * 0.5, "name": "metallic"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -185,23 +225,31 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        for i in range(3):
+            l.append('basecolor_{}'.format(i))
+        l.append('roughness')
+        l.append('metallic')
         return l
 
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
+        normals = self.normal.detach().cpu().numpy()
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        basecolor = self._basecolor.detach().cpu().numpy()
+        roughness = self._roughness.detach().cpu().numpy()
+        metallic  = self._metallic.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation,
+                                     basecolor, roughness, metallic), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -252,6 +300,20 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
+        N = xyz.shape[0]
+        pbr_names = {p.name for p in plydata.elements[0].properties}
+        if 'basecolor_0' in pbr_names:
+            basecolor = np.stack([np.asarray(plydata.elements[0]['basecolor_{}'.format(i)]) for i in range(3)], axis=1)
+            roughness = np.asarray(plydata.elements[0]["roughness"])[..., np.newaxis]
+            metallic  = np.asarray(plydata.elements[0]["metallic"])[..., np.newaxis]
+            self._basecolor = nn.Parameter(torch.tensor(basecolor, dtype=torch.float, device="cuda").requires_grad_(True))
+            self._roughness = nn.Parameter(torch.tensor(roughness, dtype=torch.float, device="cuda").requires_grad_(True))
+            self._metallic  = nn.Parameter(torch.tensor(metallic,  dtype=torch.float, device="cuda").requires_grad_(True))
+        else:
+            self._basecolor = nn.Parameter(torch.zeros((N, 3), device="cuda").requires_grad_(True))
+            self._roughness = nn.Parameter(torch.zeros((N, 1), device="cuda").requires_grad_(True))
+            self._metallic  = nn.Parameter((torch.ones((N, 1), device="cuda") * (-2.2)).requires_grad_(True))
+
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -297,9 +359,11 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._basecolor = optimizable_tensors["basecolor"]
+        self._roughness = optimizable_tensors["roughness"]
+        self._metallic  = optimizable_tensors["metallic"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
@@ -326,12 +390,20 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+        N_new = new_xyz.shape[0]
+        new_basecolor = torch.zeros((N_new, 3), device="cuda")
+        new_roughness = torch.zeros((N_new, 1), device="cuda")
+        new_metallic  = torch.ones((N_new, 1), device="cuda") * (-2.2)
+
         d = {"xyz": new_xyz,
-        "f_dc": new_features_dc,
-        "f_rest": new_features_rest,
-        "opacity": new_opacities,
-        "scaling" : new_scaling,
-        "rotation" : new_rotation}
+             "f_dc": new_features_dc,
+             "f_rest": new_features_rest,
+             "opacity": new_opacities,
+             "scaling": new_scaling,
+             "rotation": new_rotation,
+             "basecolor": new_basecolor,
+             "roughness": new_roughness,
+             "metallic":  new_metallic}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -340,6 +412,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._basecolor = optimizable_tensors["basecolor"]
+        self._roughness = optimizable_tensors["roughness"]
+        self._metallic  = optimizable_tensors["metallic"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
