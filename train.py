@@ -262,8 +262,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Output directory (alias for --model_path)")
     args = parser.parse_args(sys.argv[1:])
+    if args.output_dir:
+        args.model_path = args.output_dir
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
