@@ -185,6 +185,137 @@ def backproject_pixel_to_world(pixel_xy, depth, camera):
     return (world_view_inv @ point_cam)[:3]
 
 
+def detect_planar_groups_from_normal(
+    viewpoint_camera,
+    gaussians,
+    pipeline,
+    background,
+    render_func,
+    num_groups: int = 2,
+    min_area_ratio: float = 0.02,
+    max_area_ratio: float = 0.60,
+    angle_thresh_deg: float = 15.0,
+    n_candidates: int = 12,
+    alpha_thresh: float = 0.1,
+):
+    """
+    2DGS-native planar detection using rendered rend_normal map.
+
+    Unlike SAM-based detection (which starts from visual regions), this method
+    starts directly from the Gaussian surfel normals to find geometrically planar
+    areas, making it more aligned with 2DGS's explicit surface representation.
+
+    Algorithm:
+      1. Render → rend_normal (3,H,W) world-space + surf_depth (1,H,W)
+      2. Quantize valid pixel normals into a 3D histogram (n_bins per axis)
+      3. Find top-k dominant normal directions from histogram peaks
+      4. For each dominant normal, build pixel mask by cosine similarity
+      5. Fit plane center via depth backprojection of mask centroid
+
+    Returns:
+        List[Dict] with same schema as detect_planar_groups_from_depth_fast:
+            'mask' (H,W bool), 'dominant_normal' (3,), 'mean_depth' (float), 'center' (3,)
+    """
+    with torch.no_grad():
+        render_pkg = render_func(viewpoint_camera, gaussians, pipeline, background)
+
+    normal_map = render_pkg.get("rend_normal", None)   # (3, H, W) world space
+    depth_map  = render_pkg.get("surf_depth",  None)   # (1, H, W)
+    alpha_map  = render_pkg.get("rend_alpha",  None)   # (1, H, W)
+
+    if normal_map is None or depth_map is None:
+        return []
+
+    device = normal_map.device
+    H, W = depth_map.shape[1], depth_map.shape[2]
+    img_area = float(H * W)
+
+    # Valid pixels: depth and alpha thresholds
+    valid = depth_map[0] > 0.01
+    if alpha_map is not None:
+        valid = valid & (alpha_map[0] > alpha_thresh)
+    if valid.sum() < 100:
+        return []
+
+    # Normalize normals and get valid subset (N, 3)
+    n_map = F.normalize(normal_map, dim=0)          # (3, H, W)
+    n_flat = n_map.permute(1, 2, 0)[valid]          # (N, 3)
+
+    # Histogram quantization on the unit hemisphere.
+    # Use absolute values so front/back of plane are treated the same.
+    n_bins = 10
+    bins = (n_flat.abs() * n_bins).long().clamp(0, n_bins - 1)   # (N, 3)
+    bin_idx = bins[:, 0] * (n_bins * n_bins) + bins[:, 1] * n_bins + bins[:, 2]
+
+    counts = torch.bincount(bin_idx, minlength=n_bins ** 3)
+    top_bins = torch.topk(counts, k=min(n_candidates, int((counts > 0).sum()))).indices
+
+    cos_thresh = math.cos(angle_thresh_deg / 180.0 * math.pi)
+    valid_ys, valid_xs = torch.where(valid)
+
+    planar_groups = []
+    used_normals: list = []
+
+    for b in top_bins:
+        member = (bin_idx == b)
+        if member.sum() < 10:
+            continue
+
+        dom_normal = F.normalize(n_flat[member].mean(0), dim=0)
+
+        # Skip if too similar to an already-selected plane
+        if any(torch.abs(torch.dot(dom_normal, prev)).item() > 0.95 for prev in used_normals):
+            continue
+
+        # Build full-resolution mask by cosine similarity on all valid pixels
+        cos_sim = (n_flat * dom_normal.unsqueeze(0)).sum(dim=1).abs()  # (N,)
+        in_plane = cos_sim >= cos_thresh
+
+        area = int(in_plane.sum().item())
+        area_ratio = area / img_area
+        if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+            continue
+
+        mask_2d = torch.zeros(H, W, device=device, dtype=torch.bool)
+        mask_2d[valid_ys[in_plane], valid_xs[in_plane]] = True
+
+        # Plane center from backprojection of mask centroid + median depth
+        cluster_depth = depth_map[0][mask_2d].median()
+        ys_m, xs_m = torch.where(mask_2d)
+        center_2d = torch.tensor(
+            [xs_m.float().mean(), ys_m.float().mean()],
+            dtype=torch.float32, device=device
+        )
+        center_3d = backproject_pixel_to_world(center_2d, cluster_depth, viewpoint_camera)
+
+        # Ensure normal faces toward camera
+        cam_dir = F.normalize(viewpoint_camera.camera_center - center_3d, dim=0)
+        if (dom_normal * cam_dir).sum() < 0:
+            dom_normal = -dom_normal
+
+        used_normals.append(dom_normal)
+        planar_groups.append({
+            "mask":             mask_2d,
+            "dominant_normal":  dom_normal,
+            "mean_depth":       float(cluster_depth.item()),
+            "center":           center_3d,
+            "_area":            area,
+        })
+
+        if len(planar_groups) >= num_groups:
+            break
+
+    # Sort by area descending (largest planar region first)
+    planar_groups.sort(key=lambda g: -g["_area"])
+    for g in planar_groups:
+        g.pop("_area", None)
+
+    if planar_groups:
+        print(f"[Normal planar] {len(planar_groups)} planes found (angle_thresh={angle_thresh_deg}°)")
+
+    return planar_groups
+
+
 def detect_planar_groups_from_depth_fast(
     viewpoint_camera,
     gaussians,

@@ -14,6 +14,7 @@ import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
+from gaussian_renderer.render_2pass import render_2pass
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -28,7 +29,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, planar_mode, sam_ckpt, sam_model_type):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -40,6 +41,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    # Planar cache: built once at densify_until_iter (geometry stabilised)
+    scene.planar_cache = {}
+    planar_cache_built = False
+
+    sam_generator = None
+    if planar_mode == 0 and sam_ckpt:
+        from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+        _sam = sam_model_registry[sam_model_type](checkpoint=sam_ckpt).cuda().eval()
+        sam_generator = SamAutomaticMaskGenerator(_sam)
+        print(f"[SAM] loaded {sam_model_type} from {sam_ckpt}")
+
+    def _render_func(cam, gs, pipe_, bg):
+        return render(cam, gs, pipe_, bg)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -66,9 +81,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        # ── Build planar cache once when densification ends ──────────────
+        if planar_mode >= 0 and not planar_cache_built and iteration >= opt.densify_until_iter:
+            from utils.planar_utils import (detect_planar_groups_from_depth_fast,
+                                             detect_planar_groups_from_normal)
+            train_cams = scene.getTrainCameras()
+            print(f"\n[Planar] pre-computing planar cache (mode={'SAM' if planar_mode==0 else 'Normal'}) "
+                  f"for {len(train_cams)} cameras...")
+            for ci, cam in enumerate(train_cams):
+                cam_name = getattr(cam, "image_name", f"cam_{ci}")
+                if planar_mode == 0:
+                    groups = detect_planar_groups_from_depth_fast(
+                        cam, gaussians, pipe, background, _render_func,
+                        use_sam=(sam_generator is not None),
+                        sam_generator=sam_generator,
+                    )
+                else:  # mode 1: normal-based
+                    groups = detect_planar_groups_from_normal(
+                        cam, gaussians, pipe, background, _render_func,
+                    )
+                scene.planar_cache[cam_name] = groups
+                if (ci + 1) % 20 == 0 or ci == len(train_cams) - 1:
+                    print(f"  [{ci+1}/{len(train_cams)}] {cam_name}: {len(groups)} planes")
+            planar_cache_built = True
+            print(f"[Planar] cache built for {len(scene.planar_cache)} cameras.\n")
+        # ─────────────────────────────────────────────────────────────────
+
+        # ── Render (2-pass if planar cache ready, else base) ─────────────
+        if planar_cache_built:
+            cam_name = getattr(viewpoint_cam, "image_name", None)
+            planar_groups = scene.planar_cache.get(cam_name, [])
+            render_pkg = render_2pass(
+                viewpoint_cam, gaussians, pipe, background,
+                render_func=_render_func,
+                enable_2pass=len(planar_groups) > 0,
+                planar_groups=planar_groups,
+            )
+        else:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        # ─────────────────────────────────────────────────────────────────
+
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        
+
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
@@ -265,11 +319,17 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (alias for --model_path)")
+    parser.add_argument("--planar", type=int, default=-1,
+                        help="Planar detection mode: -1=disabled, 0=SAM-based, 1=Normal-based")
+    parser.add_argument("--sam_ckpt", type=str, default=None,
+                        help="SAM checkpoint path (required for --planar 0)")
+    parser.add_argument("--sam_model_type", type=str, default="vit_h",
+                        help="SAM model type: vit_h / vit_l / vit_b")
     args = parser.parse_args(sys.argv[1:])
     if args.output_dir:
         args.model_path = args.output_dir
     args.save_iterations.append(args.iterations)
-    
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
@@ -278,7 +338,12 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
+    training(lp.extract(args), op.extract(args), pp.extract(args),
+             args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+             args.start_checkpoint,
+             planar_mode=args.planar,
+             sam_ckpt=args.sam_ckpt,
+             sam_model_type=args.sam_model_type)
 
     # All done
     print("\nTraining complete.")
