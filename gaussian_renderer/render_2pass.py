@@ -59,6 +59,7 @@ def render_2pass(
     iteration=0,
     planar_groups=None,
     metal_map=None,
+    render_pkg_base=None,
 ):
     """
     Two-pass rendering with planar reflection and BRDF-style composition.
@@ -69,17 +70,20 @@ def render_2pass(
       - 'rend_normal' is the 2DGS surfel normal in world space
 
     Args:
-        planar_groups: List[Dict] from detect_planar_groups_from_depth_fast.
-                       If None, 2-pass is disabled (fallback to base rendering).
+        planar_groups:   List[Dict] from detect_planar_groups_from_depth_fast.
+                         If None, 2-pass is disabled (fallback to base rendering).
+        render_pkg_base: Pre-computed base render package (e.g. with f0_map already
+                         injected from MetalicNet). If None, base render is run internally.
     """
     device = pc.get_xyz.device
 
-    # ===== Step 1: Base rendering =====
-    render_pkg_base = render_func(
-        viewpoint_camera, pc, pipe, bg_color,
-        scaling_modifier=scaling_modifier,
-        override_color=override_color,
-    )
+    # ===== Step 1: Base rendering (skip if pre-computed result provided) =====
+    if render_pkg_base is None:
+        render_pkg_base = render_func(
+            viewpoint_camera, pc, pipe, bg_color,
+            scaling_modifier=scaling_modifier,
+            override_color=override_color,
+        )
 
     img_base = render_pkg_base["render"]
     H, W = img_base.shape[1], img_base.shape[2]
@@ -89,10 +93,13 @@ def render_2pass(
     # ===== Early exit if 2-pass disabled =====
     if not enable_2pass or planar_groups is None or len(planar_groups) == 0:
         return {
-            "render": img_base,
-            "viewspace_points": render_pkg_base["viewspace_points"],
+            "render":            img_base,
+            "viewspace_points":  render_pkg_base["viewspace_points"],
             "visibility_filter": render_pkg_base["visibility_filter"],
-            "radii": render_pkg_base["radii"],
+            "radii":             render_pkg_base["radii"],
+            "rend_dist":         render_pkg_base.get("rend_dist",   None),
+            "rend_normal":       render_pkg_base.get("rend_normal", None),
+            "surf_normal":       render_pkg_base.get("surf_normal", None),
         }
 
     # ===== Step 2: Multi-plane specular accumulation =====
@@ -206,6 +213,8 @@ def render_2pass(
         "radii":            render_pkg_base["radii"],
         "surf_depth":       render_pkg_base.get("surf_depth",   None),
         "rend_normal":      render_pkg_base.get("rend_normal",  None),
+        "surf_normal":      render_pkg_base.get("surf_normal",  None),
+        "rend_dist":        render_pkg_base.get("rend_dist",    None),
         "num_planes":       len(planar_groups),
         "prefiltered_pass2": I2_pref,
         "ks":               ks,

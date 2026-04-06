@@ -29,7 +29,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, planar_mode, sam_ckpt, sam_model_type):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, planar_mode, sam_ckpt, sam_model_type, metalnet_ckpt=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -53,8 +53,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sam_generator = SamAutomaticMaskGenerator(_sam)
         print(f"[SAM] loaded {sam_model_type} from {sam_ckpt}")
 
-    def _render_func(cam, gs, pipe_, bg):
-        return render(cam, gs, pipe_, bg)
+    metalnet = None
+    if metalnet_ckpt:
+        from utils.metalnet_utils import load_metalnet
+        metalnet = load_metalnet(metalnet_ckpt)
+        print(f"[MetalNet] loaded from {metalnet_ckpt}")
+
+    def _render_func(cam, gs, pipe_, bg, scaling_modifier=1.0, override_color=None):
+        return render(cam, gs, pipe_, bg, scaling_modifier=scaling_modifier, override_color=override_color)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -111,11 +117,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if planar_cache_built:
             cam_name = getattr(viewpoint_cam, "image_name", None)
             planar_groups = scene.planar_cache.get(cam_name, [])
+
+            # Base render first → MetalicNet → f0_map injection → render_2pass
+            pkg_base = render(viewpoint_cam, gaussians, pipe, background)
+            if metalnet is not None:
+                from utils.metalnet_utils import predict_metal_map, metalprob_to_f0_rgb
+                metal_map = predict_metal_map(metalnet, pkg_base)
+                f0_map = metalprob_to_f0_rgb(pkg_base, metal_map)
+                if f0_map is not None:
+                    pkg_base["f0_map"] = f0_map
+            else:
+                metal_map = None
+
             render_pkg = render_2pass(
                 viewpoint_cam, gaussians, pipe, background,
                 render_func=_render_func,
                 enable_2pass=len(planar_groups) > 0,
                 planar_groups=planar_groups,
+                metal_map=metal_map,
+                render_pkg_base=pkg_base,
             )
         else:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background)
@@ -325,6 +345,8 @@ if __name__ == "__main__":
                         help="SAM checkpoint path (required for --planar 0)")
     parser.add_argument("--sam_model_type", type=str, default="vit_h",
                         help="SAM model type: vit_h / vit_l / vit_b")
+    parser.add_argument("--metalnet_ckpt", type=str, default=None,
+                        help="MetalicNet checkpoint path for metal-aware F0 during 2-pass training")
     args = parser.parse_args(sys.argv[1:])
     if args.output_dir:
         args.model_path = args.output_dir
@@ -343,7 +365,8 @@ if __name__ == "__main__":
              args.start_checkpoint,
              planar_mode=args.planar,
              sam_ckpt=args.sam_ckpt,
-             sam_model_type=args.sam_model_type)
+             sam_model_type=args.sam_model_type,
+             metalnet_ckpt=args.metalnet_ckpt)
 
     # All done
     print("\nTraining complete.")
