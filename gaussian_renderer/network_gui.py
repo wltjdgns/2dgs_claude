@@ -28,9 +28,14 @@ def init(wish_host, wish_port):
     global host, port, listener
     host = wish_host
     port = wish_port
-    listener.bind((host, port))
-    listener.listen()
-    listener.settimeout(0)
+    try:
+        listener.bind((host, port))
+        listener.listen()
+        listener.settimeout(0)
+    except OSError:
+        print(f"[GUI] Port {port} already in use, GUI disabled.")
+        listener.close()
+        listener = None
 
 def send_json_data(conn, data):
     # Serialize the list of strings to JSON
@@ -44,6 +49,8 @@ def send_json_data(conn, data):
 
 def try_connect(render_items):
     global conn, addr, listener
+    if listener is None:
+        return
     try:
         conn, addr = listener.accept()
         # print(f"\nConnected by {addr}")

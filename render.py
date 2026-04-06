@@ -68,11 +68,14 @@ if __name__ == "__main__":
 
     # ── optional: SAM for 2-pass planar detection ───────────────────────
     sam_generator = None
-    if args.enable_2pass and args.sam_ckpt:
+    sam_ckpt = getattr(args, 'sam_ckpt', None)
+    sam_model_type = getattr(args, 'sam_model_type', 'vit_h')
+    enable_2pass = getattr(args, 'enable_2pass', False)
+    if enable_2pass and sam_ckpt:
         from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
-        sam = sam_model_registry[args.sam_model_type](checkpoint=args.sam_ckpt).cuda()
+        sam = sam_model_registry[sam_model_type](checkpoint=sam_ckpt).cuda()
         sam_generator = SamAutomaticMaskGenerator(sam)
-        print(f"[SAM] loaded {args.sam_model_type} from {args.sam_ckpt}")
+        print(f"[SAM] loaded {sam_model_type} from {sam_ckpt}")
 
     def render_func(cam, gs, pipe_, bg):
         return render(cam, gs, pipe_, bg)
@@ -82,7 +85,7 @@ if __name__ == "__main__":
         gaussExtractor.reconstruction(cameras)
         gaussExtractor.export_image(out_dir)
 
-        if not (args.enable_2pass or metalnet):
+        if not (enable_2pass or metalnet):
             return
 
         from utils.planar_utils import detect_planar_groups_from_depth_fast
@@ -103,7 +106,7 @@ if __name__ == "__main__":
                 )
 
             # ── 2-pass rendering ──
-            if args.enable_2pass:
+            if enable_2pass:
                 pkg = render_2pass(
                     cam, gaussians, pipe, background,
                     render_func=render_func,
