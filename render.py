@@ -115,10 +115,10 @@ if __name__ == "__main__":
                 )
                 # pass2 = raw specular-only render from virtual (reflected) camera
                 if 'pass2' in pkg:
-                    save_img_u8(pkg['pass2'].permute(1,2,0).cpu().numpy(),
+                    save_img_u8(pkg['pass2'].detach().permute(1,2,0).cpu().numpy(),
                                 os.path.join(vis_path, f'2pass_{stem}.png'))
                 if 'specular_mask' in pkg:
-                    m = pkg['specular_mask'].expand(3,-1,-1)
+                    m = pkg['specular_mask'].detach().expand(3,-1,-1)
                     save_img_u8(m.permute(1,2,0).cpu().numpy(),
                                 os.path.join(vis_path, f'planar_mask_{stem}.png'))
                 base_pkg = pkg   # use enriched pkg for metalnet below
@@ -128,11 +128,11 @@ if __name__ == "__main__":
                 from utils.metalnet_utils import predict_metal_map, metalprob_to_f0_rgb
                 metal = predict_metal_map(metalnet, base_pkg)
                 if metal is not None:
-                    save_img_u8(metal.expand(3,-1,-1).permute(1,2,0).cpu().numpy(),
+                    save_img_u8(metal.detach().expand(3,-1,-1).permute(1,2,0).cpu().numpy(),
                                 os.path.join(vis_path, f'metal_{stem}.png'))
                     f0 = metalprob_to_f0_rgb(base_pkg, metal)
                     if f0 is not None:
-                        save_img_u8(f0.permute(1,2,0).cpu().numpy(),
+                        save_img_u8(f0.detach().permute(1,2,0).cpu().numpy(),
                                     os.path.join(vis_path, f'f0_{stem}.png'))
 
     if not args.skip_train:
