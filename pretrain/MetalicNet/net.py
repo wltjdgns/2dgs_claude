@@ -26,9 +26,13 @@ class UNet(nn.Module):
         self.pool2 = nn.MaxPool2d(2)
         self.enc3 = ConvBlock(128, 256)
         self.pool3 = nn.MaxPool2d(2)
+        self.enc4 = ConvBlock(256, 512)
+        self.pool4 = nn.MaxPool2d(2)
 
-        self.bottleneck = ConvBlock(256, 512)
+        self.bottleneck = ConvBlock(512, 1024)
 
+        self.up4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.dec4 = ConvBlock(1024, 512)
         self.up3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
         self.dec3 = ConvBlock(512, 256)
         self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
@@ -42,9 +46,15 @@ class UNet(nn.Module):
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool1(e1))
         e3 = self.enc3(self.pool2(e2))
-        b = self.bottleneck(self.pool3(e3))
+        e4 = self.enc4(self.pool3(e3))
+        b  = self.bottleneck(self.pool4(e4))
 
-        d3 = self.up3(b)
+        d4 = self.up4(b)
+        if d4.shape[-2:] != e4.shape[-2:]:
+            d4 = F.interpolate(d4, size=e4.shape[-2:], mode="bilinear", align_corners=False)
+        d4 = self.dec4(torch.cat([d4, e4], dim=1))
+
+        d3 = self.up3(d4)
         if d3.shape[-2:] != e3.shape[-2:]:
             d3 = F.interpolate(d3, size=e3.shape[-2:], mode="bilinear", align_corners=False)
         d3 = self.dec3(torch.cat([d3, e3], dim=1))
