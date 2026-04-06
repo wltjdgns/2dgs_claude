@@ -288,8 +288,12 @@ class GaussianExtractor(object):
                         os.path.join(gts_path, stem + ".png"))
             save_img_u8(self.rgbmaps[idx].permute(1,2,0).cpu().numpy(),
                         os.path.join(render_path, stem + ".png"))
-            save_img_f32(self.depthmaps[idx][0].cpu().numpy(),
-                         os.path.join(vis_path, f'depth_{stem}.tiff'))
+            depth_np = self.depthmaps[idx][0].cpu().numpy()
+            depth_max = depth_np.max()
+            if depth_max > 0:
+                depth_np = depth_np / depth_max
+            save_img_u8(depth_np[..., None].repeat(3, axis=-1),
+                        os.path.join(vis_path, f'depth_{stem}.png'))
             save_img_u8(self.normalmaps[idx].permute(1,2,0).cpu().numpy() * 0.5 + 0.5,
                         os.path.join(vis_path, f'normal_{stem}.png'))
             if idx < len(self.albedomaps):

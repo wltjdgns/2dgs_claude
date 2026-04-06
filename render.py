@@ -119,8 +119,9 @@ if __name__ == "__main__":
                     enable_2pass=(planar_groups is not None and len(planar_groups) > 0),
                     planar_groups=planar_groups,
                 )
-                if 'render' in pkg and pkg['render'] is not pkg.get('pass1'):
-                    save_img_u8(pkg['render'].permute(1,2,0).cpu().numpy(),
+                # pass2 = raw specular-only render from virtual (reflected) camera
+                if 'pass2' in pkg:
+                    save_img_u8(pkg['pass2'].permute(1,2,0).cpu().numpy(),
                                 os.path.join(vis_path, f'2pass_{stem}.png'))
                 if 'specular_mask' in pkg:
                     m = pkg['specular_mask'].expand(3,-1,-1)
