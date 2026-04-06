@@ -77,8 +77,8 @@ if __name__ == "__main__":
         sam_generator = SamAutomaticMaskGenerator(sam)
         print(f"[SAM] loaded {sam_model_type} from {sam_ckpt}")
 
-    def render_func(cam, gs, pipe_, bg):
-        return render(cam, gs, pipe_, bg)
+    def render_func(cam, gs, pipe_, bg, scaling_modifier=1.0, override_color=None):
+        return render(cam, gs, pipe_, bg, scaling_modifier=scaling_modifier, override_color=override_color)
 
     def _run_camera_set(cameras, out_dir):
         os.makedirs(out_dir, exist_ok=True)
