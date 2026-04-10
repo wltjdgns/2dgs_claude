@@ -1,4 +1,4 @@
-name: surfel_splatting
+name: v2dgs
 channels:
   - pytorch
   - nvidia

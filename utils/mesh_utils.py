@@ -275,10 +275,13 @@ class GaussianExtractor(object):
 
     @torch.no_grad()
     def export_image(self, path):
-        render_path = os.path.join(path, "renders")
-        gts_path    = os.path.join(path, "gt")
-        vis_path    = os.path.join(path, "vis")
-        for p in [render_path, gts_path, vis_path]:
+        render_path   = os.path.join(path, "renders")
+        gts_path      = os.path.join(path, "gt")
+        depth_path    = os.path.join(path, "vis", "depth")
+        normal_path   = os.path.join(path, "vis", "normal")
+        albedo_path   = os.path.join(path, "vis", "albedo")
+        roughness_path = os.path.join(path, "vis", "roughness")
+        for p in [render_path, gts_path, depth_path, normal_path, albedo_path, roughness_path]:
             os.makedirs(p, exist_ok=True)
 
         for idx, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="export images"):
@@ -293,14 +296,14 @@ class GaussianExtractor(object):
             if depth_max > 0:
                 depth_np = depth_np / depth_max
             save_img_u8(depth_np[..., None].repeat(3, axis=-1),
-                        os.path.join(vis_path, f'depth_{stem}.png'))
+                        os.path.join(depth_path, stem + ".png"))
             save_img_u8(self.normalmaps[idx].permute(1,2,0).cpu().numpy() * 0.5 + 0.5,
-                        os.path.join(vis_path, f'normal_{stem}.png'))
+                        os.path.join(normal_path, stem + ".png"))
             if idx < len(self.albedomaps):
                 save_img_u8(self.albedomaps[idx].permute(1,2,0).cpu().numpy(),
-                            os.path.join(vis_path, f'albedo_{stem}.png'))
+                            os.path.join(albedo_path, stem + ".png"))
             if idx < len(self.roughnessmaps):
                 rough = self.roughnessmaps[idx]          # (1, H, W)
                 rough_rgb = rough.expand(3, -1, -1)      # grayscale → RGB
                 save_img_u8(rough_rgb.permute(1,2,0).cpu().numpy(),
-                            os.path.join(vis_path, f'roughness_{stem}.png'))
+                            os.path.join(roughness_path, stem + ".png"))

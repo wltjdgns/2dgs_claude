@@ -2,6 +2,15 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import math
+import atexit
+
+_planar_stats = {"total": 0, "detected": 0}
+
+@atexit.register
+def _print_planar_summary():
+    s = _planar_stats
+    if s["total"] > 0:
+        print(f"[Planar Detection] detected {s['detected']} / {s['total']} views")
 
 try:
     from sklearn.cluster import DBSCAN
@@ -310,8 +319,9 @@ def detect_planar_groups_from_normal(
     for g in planar_groups:
         g.pop("_area", None)
 
+    _planar_stats["total"] += 1
     if planar_groups:
-        print(f"[Normal planar] {len(planar_groups)} planes found (angle_thresh={angle_thresh_deg}°)")
+        _planar_stats["detected"] += 1
 
     return planar_groups
 
@@ -346,7 +356,14 @@ def detect_planar_groups_from_depth_fast(
             'mask' (H,W bool), 'dominant_normal' (3,), 'mean_depth' (float), 'center' (3,)
     """
     if not use_sam:
-        return []
+        return detect_planar_groups_from_normal(
+            viewpoint_camera, gaussians, pipeline, background, render_func,
+            num_groups=num_groups,
+            min_area_ratio=0.02,
+            max_area_ratio=0.60,
+            angle_thresh_deg=15.0,
+            n_candidates=12,
+        )
     if sam_generator is None:
         raise ValueError("use_sam=True but sam_generator is None")
 
@@ -455,6 +472,7 @@ def detect_planar_groups_from_depth_fast(
             })
 
         if len(planar_groups) == 0:
+            _planar_stats["total"] += 1
             return []
 
         if prefer_center and prefer_near:
@@ -468,9 +486,8 @@ def detect_planar_groups_from_depth_fast(
 
         planar_groups = planar_groups[:num_groups]
 
-        print(f"[SAM planar] {len(planar_groups)} planes found:")
-        for g in planar_groups[:5]:
-            print(f"  area={g['_area']/img_area:.2f}, fit={g['_score']:.3f}, depth={g['mean_depth']:.2f}")
+        _planar_stats["total"] += 1
+        _planar_stats["detected"] += 1
 
         for g in planar_groups:
             g.pop("_score", None)

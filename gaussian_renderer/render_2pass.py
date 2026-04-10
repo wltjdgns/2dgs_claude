@@ -190,15 +190,23 @@ def render_2pass(
     else:
         I2_pref = img_specular_accum
 
-    # --- energy-consistent blend ---
-    ks = (M * lambda_weight) * G_term
-    ks_rgb = torch.clamp(ks, 0, 1) * torch.clamp(F_term, 0, 1)
+    # --- metalness (from MetalicNet, per-pixel) ---
+    if metal_map is not None:
+        metal = metal_map.clamp(0, 1)
+        if metal.dim() == 2:
+            metal = metal.unsqueeze(0)   # (1, H, W)
+    else:
+        metal = torch.zeros(1, H, W, device=device)
 
-    spec_energy = ks_rgb.mean(dim=0, keepdim=True).clamp(min=1e-6)
-    spec_norm   = ks_rgb / (spec_energy + 1e-6)
+    # --- specular weight: Fresnel × geometry × planar mask × global scale ---
+    # lambda_weight is an artistic knob for reflection intensity, not a 50/50 split
+    ks_rgb = torch.clamp(F_term * G_term * M * lambda_weight, 0, 1)  # (3, H, W)
 
-    kd_rgb = (1.0 - ks_rgb).clamp(0, 1)
-    img_final = kd_rgb * img_base + ks_rgb * (spec_norm * I2_pref)
+    # --- diffuse weight: energy conservation, suppressed on metallic pixels ---
+    # metals: kd → 0 (all energy in specular), dielectrics: kd = (1 - ks)
+    kd_rgb = (1.0 - metal) * (1.0 - ks_rgb).clamp(0, 1)
+
+    img_final = kd_rgb * img_base + ks_rgb * I2_pref
 
     return {
         "render":           img_final,
@@ -217,8 +225,8 @@ def render_2pass(
         "rend_dist":        render_pkg_base.get("rend_dist",    None),
         "num_planes":       len(planar_groups),
         "prefiltered_pass2": I2_pref,
-        "ks":               ks,
+        "ks":               ks_rgb,
         "F0":               F0,
         "F_term":           F_term,
-        "lambda":           ks.mean().item(),
+        "lambda":           ks_rgb.mean().item(),
     }

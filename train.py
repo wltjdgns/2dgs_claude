@@ -1,14 +1,3 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
 import os
 import torch
 from random import randint
@@ -29,7 +18,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, planar_mode, sam_ckpt, sam_model_type, metalnet_ckpt=None):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, planar_mode, sam_ckpt, sam_model_type, metalnet_ckpt=None, num_groups=1, angle_thresh=15.0, sam_plane_dot_thresh=0.85, lambda_weight=0.5):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -101,16 +90,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         cam, gaussians, pipe, background, _render_func,
                         use_sam=(sam_generator is not None),
                         sam_generator=sam_generator,
+                        num_groups=num_groups,
+                        sam_plane_dot_thresh=sam_plane_dot_thresh,
                     )
                 else:  # mode 1: normal-based
                     groups = detect_planar_groups_from_normal(
                         cam, gaussians, pipe, background, _render_func,
+                        num_groups=num_groups,
+                        angle_thresh_deg=angle_thresh,
                     )
                 scene.planar_cache[cam_name] = groups
                 if (ci + 1) % 20 == 0 or ci == len(train_cams) - 1:
                     print(f"  [{ci+1}/{len(train_cams)}] {cam_name}: {len(groups)} planes")
             planar_cache_built = True
             print(f"[Planar] cache built for {len(scene.planar_cache)} cameras.\n")
+
+            # Save to disk so render.py can reuse without re-running detection
+            cache_path = os.path.join(dataset.model_path, "planar_cache.pt")
+            cpu_cache = {
+                cam_name: [
+                    {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in g.items()}
+                    for g in groups
+                ]
+                for cam_name, groups in scene.planar_cache.items()
+            }
+            torch.save(cpu_cache, cache_path)
+            print(f"[Planar] cache saved → {cache_path}")
         # ─────────────────────────────────────────────────────────────────
 
         # ── Render (2-pass if planar cache ready, else base) ─────────────
@@ -136,6 +141,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 planar_groups=planar_groups,
                 metal_map=metal_map,
                 render_pkg_base=pkg_base,
+                lambda_weight=lambda_weight,
             )
         else:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background)
@@ -347,6 +353,14 @@ if __name__ == "__main__":
                         help="SAM model type: vit_h / vit_l / vit_b")
     parser.add_argument("--metalnet_ckpt", type=str, default=None,
                         help="MetalicNet checkpoint path for metal-aware F0 during 2-pass training")
+    parser.add_argument("--num_groups", type=int, default=1,
+                        help="Max number of planar groups to detect per frame")
+    parser.add_argument("--angle_thresh", type=float, default=15.0,
+                        help="Normal angle threshold (deg) for normal-based planar detection")
+    parser.add_argument("--sam_plane_dot_thresh", type=float, default=0.85,
+                        help="Planarity dot-product threshold for SAM-based detection")
+    parser.add_argument("--lambda_weight", type=float, default=0.5,
+                        help="Specular blend weight in render_2pass BRDF composition")
     args = parser.parse_args(sys.argv[1:])
     if args.output_dir:
         args.model_path = args.output_dir
@@ -366,7 +380,11 @@ if __name__ == "__main__":
              planar_mode=args.planar,
              sam_ckpt=args.sam_ckpt,
              sam_model_type=args.sam_model_type,
-             metalnet_ckpt=args.metalnet_ckpt)
+             metalnet_ckpt=args.metalnet_ckpt,
+             num_groups=args.num_groups,
+             angle_thresh=args.angle_thresh,
+             sam_plane_dot_thresh=args.sam_plane_dot_thresh,
+             lambda_weight=args.lambda_weight)
 
     # All done
     print("\nTraining complete.")

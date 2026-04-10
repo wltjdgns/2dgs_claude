@@ -37,13 +37,11 @@ if __name__ == "__main__":
                         help="Output directory (alias for --model_path)")
     # PBR / 2-pass options
     parser.add_argument("--enable_2pass", action="store_true",
-                        help="Enable 2-pass planar reflection rendering (requires SAM)")
-    parser.add_argument("--sam_ckpt", type=str, default=None,
-                        help="Path to SAM checkpoint (e.g. sam_vit_h_4b8939.pth)")
-    parser.add_argument("--sam_model_type", type=str, default="vit_h",
-                        help="SAM model type: vit_h / vit_l / vit_b")
+                        help="Enable 2-pass planar reflection rendering (loads planar_cache.pt from model dir)")
     parser.add_argument("--metalnet_ckpt", type=str, default=None,
                         help="Path to MetalicNet checkpoint for metal map inference")
+    parser.add_argument("--lambda_weight", type=float, default=0.5,
+                        help="Specular blend weight in render_2pass BRDF composition")
     args = get_combined_args(parser)
     if args.output_dir:
         args.model_path = args.output_dir
@@ -77,6 +75,21 @@ if __name__ == "__main__":
         sam_generator = SamAutomaticMaskGenerator(sam)
         print(f"[SAM] loaded {sam_model_type} from {sam_ckpt}")
 
+    # ── Load planar cache saved by train.py (preferred over re-detection) ──
+    planar_cache = None
+    if enable_2pass:
+        cache_path = os.path.join(args.model_path, "planar_cache.pt")
+        if os.path.exists(cache_path):
+            raw_cache = torch.load(cache_path, map_location="cpu")
+            planar_cache = {
+                cam_name: [
+                    {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in g.items()}
+                    for g in groups
+                ]
+                for cam_name, groups in raw_cache.items()
+            }
+            print(f"[Planar] loaded cache ({len(planar_cache)} cameras) from {cache_path}")
+
     def render_func(cam, gs, pipe_, bg, scaling_modifier=1.0, override_color=None):
         return render(cam, gs, pipe_, bg, scaling_modifier=scaling_modifier, override_color=override_color)
 
@@ -90,19 +103,30 @@ if __name__ == "__main__":
 
         from utils.planar_utils import detect_planar_groups_from_depth_fast
         from gaussian_renderer.render_2pass import render_2pass
-        vis_path = os.path.join(out_dir, "vis")
-        os.makedirs(vis_path, exist_ok=True)
+        twopass_path    = os.path.join(out_dir, "vis", "2pass")
+        planar_path     = os.path.join(out_dir, "vis", "planar_mask")
+        metal_path      = os.path.join(out_dir, "vis", "metal")
+        f0_path         = os.path.join(out_dir, "vis", "f0")
+        for p in [twopass_path, planar_path, metal_path, f0_path]:
+            os.makedirs(p, exist_ok=True)
 
         for idx, cam in tqdm(enumerate(cameras), desc="PBR / 2-pass export"):
             stem = '{0:05d}'.format(idx)
             base_pkg = render(cam, gaussians, pipe, background)
 
-            # ── SAM planar detection (per-frame, optional) ──
-            planar_groups = None
-            if sam_generator is not None:
+            # ── Resolve planar groups: cache → SAM → normal-based fallback ──
+            cam_name = getattr(cam, "image_name", f"cam_{idx}")
+            if planar_cache is not None:
+                planar_groups = planar_cache.get(cam_name, [])
+            elif sam_generator is not None:
                 planar_groups = detect_planar_groups_from_depth_fast(
                     cam, gaussians, pipe, background, render_func,
                     use_sam=True, sam_generator=sam_generator,
+                )
+            else:
+                planar_groups = detect_planar_groups_from_depth_fast(
+                    cam, gaussians, pipe, background, render_func,
+                    use_sam=False,
                 )
 
             # ── 2-pass rendering ──
@@ -112,15 +136,16 @@ if __name__ == "__main__":
                     render_func=render_func,
                     enable_2pass=(planar_groups is not None and len(planar_groups) > 0),
                     planar_groups=planar_groups,
+                    lambda_weight=args.lambda_weight,
                 )
                 # pass2 = raw specular-only render from virtual (reflected) camera
                 if 'pass2' in pkg:
                     save_img_u8(pkg['pass2'].detach().permute(1,2,0).cpu().numpy(),
-                                os.path.join(vis_path, f'2pass_{stem}.png'))
+                                os.path.join(twopass_path, f'{stem}.png'))
                 if 'specular_mask' in pkg:
                     m = pkg['specular_mask'].detach().expand(3,-1,-1)
                     save_img_u8(m.permute(1,2,0).cpu().numpy(),
-                                os.path.join(vis_path, f'planar_mask_{stem}.png'))
+                                os.path.join(planar_path, f'{stem}.png'))
                 base_pkg = pkg   # use enriched pkg for metalnet below
 
             # ── MetalicNET ──
@@ -129,11 +154,11 @@ if __name__ == "__main__":
                 metal = predict_metal_map(metalnet, base_pkg)
                 if metal is not None:
                     save_img_u8(metal.detach().expand(3,-1,-1).permute(1,2,0).cpu().numpy(),
-                                os.path.join(vis_path, f'metal_{stem}.png'))
+                                os.path.join(metal_path, f'{stem}.png'))
                     f0 = metalprob_to_f0_rgb(base_pkg, metal)
                     if f0 is not None:
                         save_img_u8(f0.detach().permute(1,2,0).cpu().numpy(),
-                                    os.path.join(vis_path, f'f0_{stem}.png'))
+                                    os.path.join(f0_path, f'{stem}.png'))
 
     if not args.skip_train:
         print("export training images ...")
