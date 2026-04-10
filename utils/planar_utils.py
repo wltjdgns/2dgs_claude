@@ -332,15 +332,20 @@ def detect_planar_groups_from_depth_fast(
     pipeline,
     background,
     render_func,
-    num_groups=1,
+    # [v2] num_groups 1→3: 태블릿+테이블+벽 동시 탐지 허용
+    num_groups=3,
     min_group_size=1000,
     # SAM options
     use_sam: bool = False,
     sam_generator=None,
     sam_max_masks: int = 80,
     sam_min_area_ratio: float = 0.01,
-    sam_max_area_ratio: float = 0.50,
+    # [v2] 0.50→0.70: 화면 절반 이상 차지하는 테이블 마스크 허용
+    sam_max_area_ratio: float = 0.70,
     sam_plane_dot_thresh: float = 0.85,
+    # [v2] SVD depth fitting threshold (0.05→0.08) + normal fallback 판정 각도
+    sam_plane_fit_thresh: float = 0.08,
+    sam_normal_fallback_deg: float = 20.0,
     # selection options
     prefer_center: bool = False,
     prefer_near: bool = False,
@@ -438,14 +443,33 @@ def detect_planar_groups_from_depth_fast(
 
             residuals = ((pts - centroid) * plane_n.unsqueeze(0)).sum(dim=-1).abs()
             mean_residual = residuals.mean().item()
-            if mean_residual > 0.05:
-                continue
 
-            dot_med = 1.0 - mean_residual
+            if mean_residual > sam_plane_fit_thresh:
+                # [v2] SVD depth fitting 실패 — specular 표면 대응: normal consistency fallback
+                # specular 재질(e.g. 태블릿 화면)은 depth가 noisy해도
+                # 2DGS rendered normal은 평면 방향을 비교적 일관되게 유지할 수 있음.
+                if normal_map is None:
+                    continue
+                nmap_in = normal_map[:, ys, xs]          # (3, N) world-space normals
+                if nmap_in.shape[1] < 10:
+                    continue
+                norms_unit = F.normalize(nmap_in.float(), dim=0).T   # (N, 3)
+                mean_n_world = F.normalize(norms_unit.mean(0), dim=0)
+                consistency = (norms_unit @ mean_n_world).mean().item()
+                normal_thresh = math.cos(math.radians(sam_normal_fallback_deg))
+                if consistency <= normal_thresh:
+                    # normal도 불균일 → 진짜 비평면 영역
+                    continue
+                # normal이 일관적 → 평면으로 인정, normal 기반 법선 사용
+                plane_n_world = mean_n_world
+                dot_med = consistency
+            else:
+                # SVD depth fitting 성공 — camera space → world space 변환
+                R_cam_to_world = viewpoint_camera.world_view_transform[:3, :3].T
+                plane_n_world = F.normalize(R_cam_to_world @ plane_n, dim=0)
+                dot_med = 1.0 - mean_residual
 
-            # Camera space → world space
-            R_cam_to_world = viewpoint_camera.world_view_transform[:3, :3].T
-            plane_n_world = F.normalize(R_cam_to_world @ plane_n, dim=0)
+            # camera를 향하도록 normal 방향 정규화 (depth/normal 두 경로 공통)
             cam_dir = F.normalize(viewpoint_camera.camera_center - centroid.squeeze(0), dim=0)
             if (plane_n_world * cam_dir).sum() < 0:
                 plane_n_world = -plane_n_world
