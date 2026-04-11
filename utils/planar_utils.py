@@ -345,9 +345,9 @@ def detect_planar_groups_from_depth_fast(
     sam_plane_dot_thresh: float = 0.85,
     # [v2] SVD depth fitting threshold (0.05→0.08) + normal fallback 판정 각도
     # fallback_deg: 값이 클수록 관대 (노이즈↑), 작을수록 엄격 (탐지율↓)
-    # Normal-based 방식의 과탐지를 막기 위해 12°로 설정
+    # Normal-based 방식의 과탐지를 막기 위해 9°로 설정 (12°→9°: 2_custom 과탐지 억제)
     sam_plane_fit_thresh: float = 0.08,
-    sam_normal_fallback_deg: float = 12.0,
+    sam_normal_fallback_deg: float = 9.0,
     # selection options
     prefer_center: bool = False,
     prefer_near: bool = False,
