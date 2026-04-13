@@ -45,7 +45,7 @@ if __name__ == "__main__":
     args = get_combined_args(parser)
     # -m: point cloud / scene 로딩 경로 (변경 없음)
     # --output-dir: 렌더 이미지 저장 경로 (미지정 시 -m 과 동일)
-    out_base = args.output_dir if args.output_dir else args.model_path
+    out_base = getattr(args, 'output_dir', None) or args.model_path
     print(f"Model path : {args.model_path}")
     print(f"Output dir : {out_base}")
 
