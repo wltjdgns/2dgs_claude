@@ -101,4 +101,19 @@ if __name__ == "__main__":
     parser.add_argument('--split', type=str, default='test', choices=['train', 'test'],
                         help='Evaluate on train or test split (default: test)')
     args = parser.parse_args()
-    evaluate(args.model_paths, args.split)
+
+    # 입력 경로마다: 직접 모델 폴더면 그대로, 부모 폴더면 하위 모델 폴더 자동 탐색
+    resolved = []
+    for p in args.model_paths:
+        path = Path(p)
+        if (path / args.split).exists():
+            resolved.append(str(path))
+        else:
+            subdirs = sorted([d for d in path.iterdir() if d.is_dir() and (d / args.split).exists()])
+            if subdirs:
+                print(f"[metrics] '{p}' 하위 {len(subdirs)}개 폴더 자동 탐색: {[d.name for d in subdirs]}")
+                resolved.extend([str(d) for d in subdirs])
+            else:
+                print(f"[metrics] '{p}' 에서 '{args.split}/' 폴더를 찾을 수 없습니다. 건너뜁니다.")
+
+    evaluate(resolved, args.split)
