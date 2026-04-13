@@ -38,7 +38,7 @@ if __name__ == "__main__":
     # PBR / 2-pass options
     parser.add_argument("--enable_2pass", action="store_true",
                         help="Enable 2-pass planar reflection rendering (loads planar_cache.pt from model dir)")
-    parser.add_argument("--metalnet_ckpt", type=str, default=None,
+    parser.add_argument("--metalnet_ckpt", type=str, default="./pretrain/MetalicNet/metal.pth",
                         help="Path to MetalicNet checkpoint for metal map inference")
     parser.add_argument("--lambda_weight", type=float, default=0.5,
                         help="Specular blend weight in render_2pass BRDF composition")
@@ -114,6 +114,21 @@ if __name__ == "__main__":
             stem = '{0:05d}'.format(idx)
             base_pkg = render(cam, gaussians, pipe, background)
 
+            # ── MetalicNET (먼저 실행: F0/metal_map을 2pass에 주입하기 위해) ──
+            metal_map = None
+            if metalnet is not None:
+                from utils.metalnet_utils import predict_metal_map, metalprob_to_f0_rgb
+                metal_map = predict_metal_map(metalnet, base_pkg)
+                if metal_map is not None:
+                    save_img_u8(metal_map.detach().expand(3,-1,-1).permute(1,2,0).cpu().numpy(),
+                                os.path.join(metal_path, f'{stem}.png'))
+                    f0 = metalprob_to_f0_rgb(base_pkg, metal_map)
+                    if f0 is not None:
+                        save_img_u8(f0.detach().permute(1,2,0).cpu().numpy(),
+                                    os.path.join(f0_path, f'{stem}.png'))
+                        # f0_map을 base_pkg에 주입 → render_2pass에서 F0로 사용
+                        base_pkg["f0_map"] = f0
+
             # ── Resolve planar groups: cache → SAM → normal-based fallback ──
             cam_name = getattr(cam, "image_name", f"cam_{idx}")
             if planar_cache is not None:
@@ -129,7 +144,7 @@ if __name__ == "__main__":
                     use_sam=False,
                 )
 
-            # ── 2-pass rendering ──
+            # ── 2-pass rendering (metal_map + f0_map 주입된 base_pkg 사용) ──
             if enable_2pass:
                 pkg = render_2pass(
                     cam, gaussians, pipe, background,
@@ -137,8 +152,9 @@ if __name__ == "__main__":
                     enable_2pass=(planar_groups is not None and len(planar_groups) > 0),
                     planar_groups=planar_groups,
                     lambda_weight=args.lambda_weight,
+                    metal_map=metal_map,
+                    render_pkg_base=base_pkg,
                 )
-                # pass2 = raw specular-only render from virtual (reflected) camera
                 if 'pass2' in pkg:
                     save_img_u8(pkg['pass2'].detach().permute(1,2,0).cpu().numpy(),
                                 os.path.join(twopass_path, f'{stem}.png'))
@@ -146,19 +162,6 @@ if __name__ == "__main__":
                     m = pkg['specular_mask'].detach().expand(3,-1,-1)
                     save_img_u8(m.permute(1,2,0).cpu().numpy(),
                                 os.path.join(planar_path, f'{stem}.png'))
-                base_pkg = pkg   # use enriched pkg for metalnet below
-
-            # ── MetalicNET ──
-            if metalnet is not None:
-                from utils.metalnet_utils import predict_metal_map, metalprob_to_f0_rgb
-                metal = predict_metal_map(metalnet, base_pkg)
-                if metal is not None:
-                    save_img_u8(metal.detach().expand(3,-1,-1).permute(1,2,0).cpu().numpy(),
-                                os.path.join(metal_path, f'{stem}.png'))
-                    f0 = metalprob_to_f0_rgb(base_pkg, metal)
-                    if f0 is not None:
-                        save_img_u8(f0.detach().permute(1,2,0).cpu().numpy(),
-                                    os.path.join(f0_path, f'{stem}.png'))
 
     if not args.skip_train:
         print("export training images ...")
