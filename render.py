@@ -43,9 +43,11 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_weight", type=float, default=0.5,
                         help="Specular blend weight in render_2pass BRDF composition")
     args = get_combined_args(parser)
-    if args.output_dir:
-        args.model_path = args.output_dir
-    print("Rendering " + args.model_path)
+    # -m: point cloud / scene 로딩 경로 (변경 없음)
+    # --output-dir: 렌더 이미지 저장 경로 (미지정 시 -m 과 동일)
+    out_base = args.output_dir if args.output_dir else args.model_path
+    print(f"Model path : {args.model_path}")
+    print(f"Output dir : {out_base}")
 
     dataset, iteration, pipe = model.extract(args), args.iteration, pipeline.extract(args)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -53,8 +55,8 @@ if __name__ == "__main__":
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    train_dir = os.path.join(args.model_path, 'train', "ours_{}".format(scene.loaded_iter))
-    test_dir  = os.path.join(args.model_path, 'test',  "ours_{}".format(scene.loaded_iter))
+    train_dir = os.path.join(out_base, 'train', "ours_{}".format(scene.loaded_iter))
+    test_dir  = os.path.join(out_base, 'test',  "ours_{}".format(scene.loaded_iter))
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)
 
     # ── optional: MetalicNET ────────────────────────────────────────────
@@ -174,7 +176,7 @@ if __name__ == "__main__":
     
     if args.render_path:
         print("render videos ...")
-        traj_dir = os.path.join(args.model_path, 'traj', "ours_{}".format(scene.loaded_iter))
+        traj_dir = os.path.join(out_base, 'traj', "ours_{}".format(scene.loaded_iter))
         os.makedirs(traj_dir, exist_ok=True)
         n_fames = 240
         cam_traj = generate_path(scene.getTrainCameras(), n_frames=n_fames)
