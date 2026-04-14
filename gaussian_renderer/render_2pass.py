@@ -190,17 +190,21 @@ def render_2pass(
     else:
         I2_pref = img_specular_accum
 
-    # --- specular gate: roughness 기반 (metalnet 대신) ---
-    # smooth(roughness≈0) → 반사 강함 (태블릿 화면, 거울)
-    # rough (roughness≈1) → 반사 없음 (벽, 매트 표면)
-    # 과탐지 영역은 roughness가 높게 학습되어 자기 보정(self-correcting)
-    specularity = (1.0 - r).clamp(0, 1)  # (1, H, W)
+    # --- metalness (from MetalicNet, per-pixel) ---
+    if metal_map is not None:
+        metal = metal_map.clamp(0, 1)
+        if metal.dim() == 2:
+            metal = metal.unsqueeze(0)   # (1, H, W)
+    else:
+        metal = torch.zeros(1, H, W, device=device)
 
-    # --- specular weight: specularity × planar mask × global scale ---
-    ks_rgb = (M * specularity * lambda_weight).clamp(0, 1)  # (3, H, W) via broadcast
+    # --- specular weight: Fresnel × geometry × planar mask × global scale ---
+    # lambda_weight is an artistic knob for reflection intensity, not a 50/50 split
+    ks_rgb = torch.clamp(F_term * G_term * M * lambda_weight, 0, 1)  # (3, H, W)
 
-    # --- diffuse weight: energy conservation ---
-    kd_rgb = (1.0 - ks_rgb).clamp(0, 1)
+    # --- diffuse weight: energy conservation, suppressed on metallic pixels ---
+    # metals: kd → 0 (all energy in specular), dielectrics: kd = (1 - ks)
+    kd_rgb = (1.0 - metal) * (1.0 - ks_rgb).clamp(0, 1)
 
     img_final = kd_rgb * img_base + ks_rgb * I2_pref
 
