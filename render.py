@@ -42,6 +42,12 @@ if __name__ == "__main__":
                         help="Path to MetalicNet checkpoint for metal map inference")
     parser.add_argument("--lambda_weight", type=float, default=0.5,
                         help="Specular blend weight in render_2pass BRDF composition")
+    parser.add_argument("--planar_cache_path", type=str, default=None,
+                        help="Path to planar cache .pt file (overrides default planar_cache.pt). "
+                             "Generate with scripts/gen_specular_mask.py")
+    parser.add_argument("--spec_thresh", type=float, default=0.5,
+                        help="Specularity threshold for roughness-based planar detection "
+                             "(fallback when no cache/SAM). Run scripts/debug_roughness.py to calibrate.")
     args = get_combined_args(parser)
     # -m: point cloud / scene 로딩 경로 (변경 없음)
     # --output-dir: 렌더 이미지 저장 경로 (미지정 시 -m 과 동일)
@@ -77,10 +83,11 @@ if __name__ == "__main__":
         sam_generator = SamAutomaticMaskGenerator(sam)
         print(f"[SAM] loaded {sam_model_type} from {sam_ckpt}")
 
-    # ── Load planar cache saved by train.py (preferred over re-detection) ──
+    # ── Load planar cache (custom path → default planar_cache.pt) ──
     planar_cache = None
     if enable_2pass:
-        cache_path = os.path.join(args.model_path, "planar_cache.pt")
+        cache_path = getattr(args, 'planar_cache_path', None) or \
+                     os.path.join(args.model_path, "planar_cache.pt")
         if os.path.exists(cache_path):
             raw_cache = torch.load(cache_path, map_location="cpu")
             planar_cache = {
@@ -131,7 +138,7 @@ if __name__ == "__main__":
                         # f0_map을 base_pkg에 주입 → render_2pass에서 F0로 사용
                         base_pkg["f0_map"] = f0
 
-            # ── Resolve planar groups: cache → SAM → normal-based fallback ──
+            # ── Resolve planar groups: cache → SAM → specularity-based (B) ──
             cam_name = getattr(cam, "image_name", f"cam_{idx}")
             if planar_cache is not None:
                 planar_groups = planar_cache.get(cam_name, [])
@@ -141,9 +148,12 @@ if __name__ == "__main__":
                     use_sam=True, sam_generator=sam_generator,
                 )
             else:
-                planar_groups = detect_planar_groups_from_depth_fast(
-                    cam, gaussians, pipe, background, render_func,
-                    use_sam=False,
+                # [B] specularity-guided detection: uses roughnessmap as prior
+                # prioritizes reflective surfaces (tablet screen) over matte planes
+                from utils.planar_utils import detect_planar_from_specularity
+                planar_groups = detect_planar_from_specularity(
+                    cam, base_pkg,
+                    spec_thresh=getattr(args, 'spec_thresh', 0.5),
                 )
 
             # ── 2-pass rendering (metal_map + f0_map 주입된 base_pkg 사용) ──

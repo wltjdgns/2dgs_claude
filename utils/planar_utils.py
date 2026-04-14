@@ -521,3 +521,123 @@ def detect_planar_groups_from_depth_fast(
             g.pop("_center_dist", None)
 
         return planar_groups
+
+
+def detect_planar_from_specularity(
+    viewpoint_camera,
+    render_pkg: dict,
+    spec_thresh: float = 0.5,
+    normal_consistency_deg: float = 15.0,
+    min_area_ratio: float = 0.005,
+    max_area_ratio: float = 0.5,
+    num_groups: int = 3,
+    n_candidates: int = 12,
+):
+    """
+    Specularity-guided planar detection using roughnessmap from 2DGS render.
+
+    Geometry-first detection (SAM/normal histogram) fails for specular surfaces
+    like tablet screens because:
+      - depth is noisy on specular regions (SVD residual too high)
+      - large matte planes (table/wall/floor) dominate the histogram
+
+    This method inverts the priority:
+      specularity = 1 - roughness  →  high-specularity mask  →  planarity check
+
+    Returns same format as detect_planar_groups_from_depth_fast.
+    """
+    roughness = render_pkg.get("roughnessmap", None)
+    normal_map = render_pkg.get("rend_normal", None)
+    depth_map = render_pkg.get("surf_depth", None)
+
+    if roughness is None or normal_map is None or depth_map is None:
+        return []
+
+    device = roughness.device
+    if roughness.dim() == 3:
+        roughness = roughness[0]   # (H, W)
+    if depth_map.dim() == 3:
+        depth_map = depth_map[0]   # (H, W)
+
+    H, W = roughness.shape
+    img_area = float(H * W)
+
+    specularity = (1.0 - roughness.clamp(0, 1))  # (H, W)
+    valid_depth = depth_map > 0.01
+    spec_mask = (specularity > spec_thresh) & valid_depth
+
+    if spec_mask.sum() < 100:
+        return []
+
+    n_map = F.normalize(normal_map, dim=0)          # (3, H, W)
+    ys, xs = torch.where(spec_mask)
+    n_flat = n_map.permute(1, 2, 0)[ys, xs]        # (N, 3)
+
+    # Histogram peak clustering (same strategy as detect_planar_groups_from_normal)
+    n_bins = 10
+    bins = (n_flat.abs() * n_bins).long().clamp(0, n_bins - 1)
+    bin_idx = bins[:, 0] * (n_bins * n_bins) + bins[:, 1] * n_bins + bins[:, 2]
+    counts = torch.bincount(bin_idx, minlength=n_bins ** 3)
+    top_bins = torch.topk(counts, k=min(n_candidates, int((counts > 0).sum()))).indices
+
+    cos_thresh = math.cos(math.radians(normal_consistency_deg))
+    n_map_flat = n_map.permute(1, 2, 0).reshape(-1, 3)  # (H*W, 3)
+
+    planar_groups = []
+    used_normals: list = []
+
+    for b in top_bins:
+        member = (bin_idx == b)
+        if member.sum() < 10:
+            continue
+
+        dom_normal = F.normalize(n_flat[member].mean(0), dim=0)
+
+        if any(torch.abs(torch.dot(dom_normal, prev)).item() > 0.95 for prev in used_normals):
+            continue
+
+        # Pixels that are both specular AND normal-consistent with this plane
+        cos_sim = (n_map_flat * dom_normal).sum(-1).abs().reshape(H, W)
+        plane_mask = spec_mask & (cos_sim >= cos_thresh)
+
+        area = int(plane_mask.sum().item())
+        area_ratio = area / img_area
+        if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+            continue
+
+        pys, pxs = torch.where(plane_mask)
+        cluster_depth = depth_map[plane_mask].median()
+        center_2d = torch.tensor(
+            [pxs.float().mean(), pys.float().mean()],
+            dtype=torch.float32, device=device
+        )
+        center_3d = backproject_pixel_to_world(center_2d, cluster_depth, viewpoint_camera)
+
+        cam_dir = F.normalize(viewpoint_camera.camera_center - center_3d, dim=0)
+        if (dom_normal * cam_dir).sum() < 0:
+            dom_normal = -dom_normal
+
+        used_normals.append(dom_normal)
+        planar_groups.append({
+            "mask":            plane_mask,
+            "dominant_normal": dom_normal,
+            "mean_depth":      float(cluster_depth.item()),
+            "center":          center_3d,
+            "_area":           area,
+            "_mean_spec":      float(specularity[plane_mask].mean().item()),
+        })
+
+        if len(planar_groups) >= num_groups:
+            break
+
+    # Sort by specularity (most reflective first), not area
+    planar_groups.sort(key=lambda g: -g["_mean_spec"])
+    for g in planar_groups:
+        g.pop("_area", None)
+        g.pop("_mean_spec", None)
+
+    _planar_stats["total"] += 1
+    if planar_groups:
+        _planar_stats["detected"] += 1
+
+    return planar_groups
