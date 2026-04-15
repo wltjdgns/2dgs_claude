@@ -150,7 +150,7 @@ def extract_plane_from_bbox(cam, pkg, bbox, save_debug_img=None):
 
     # 디버그 이미지 저장 (bbox overlay)
     if save_debug_img is not None:
-        import imageio
+        from PIL import Image
         img = pkg["render"].detach().permute(1, 2, 0).cpu().numpy()
         img = (img * 255).clip(0, 255).astype(np.uint8).copy()
         # bbox 테두리 그리기 (빨간색)
@@ -158,7 +158,7 @@ def extract_plane_from_bbox(cam, pkg, bbox, save_debug_img=None):
         img[y1:y2, x2-3:x2]   = [255, 0, 0]
         img[y1:y1+3, x1:x2]   = [255, 0, 0]
         img[y2-3:y2, x1:x2]   = [255, 0, 0]
-        imageio.imwrite(save_debug_img, img)
+        Image.fromarray(img).save(save_debug_img)
         print(f"  디버그 이미지 저장: {save_debug_img}")
 
     return plane_normal, plane_center
