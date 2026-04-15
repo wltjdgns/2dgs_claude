@@ -102,63 +102,64 @@ def extract_plane_from_bbox(cam, pkg, bbox, save_debug_img=None):
     if depth_map is None or normal_map is None:
         raise RuntimeError("surf_depth 또는 rend_normal이 render_pkg에 없습니다.")
 
-    device    = depth_map.device
-    H, W      = depth_map.shape[1], depth_map.shape[2]
-    x1, y1, x2, y2 = bbox
+    from PIL import Image, ImageDraw
 
-    # 경계 클램핑
-    x1, x2 = max(0, x1), min(W, x2)
-    y1, y2 = max(0, y1), min(H, y2)
+    device = depth_map.device
+    H, W   = depth_map.shape[1], depth_map.shape[2]
+    valid  = depth_map[0] > 0.01                         # (H,W)
 
-    valid = depth_map[0] > 0.01                          # (H,W)
+    # ── 폴리곤 마스크 생성 (PIL) ──────────────────────────────────────────
+    # bbox: [x1,y1,x2,y2] → 직사각형  |  poly: [x1,y1,...,x4,y4] → 임의 사각형
+    poly_img  = Image.new("L", (W, H), 0)
+    draw      = ImageDraw.Draw(poly_img)
+    draw.polygon(bbox, fill=255)                          # bbox는 꼭짓점 리스트
+    region_mask = torch.from_numpy(
+        np.array(poly_img) > 0
+    ).to(device)                                          # (H,W) bool
 
-    bbox_mask = torch.zeros(H, W, device=device, dtype=torch.bool)
-    bbox_mask[y1:y2, x1:x2] = True
-    bbox_valid = bbox_mask & valid
-
-    n_pixels = int(bbox_valid.sum().item())
-    print(f"  bbox 유효 픽셀: {n_pixels} / {(y2-y1)*(x2-x1)}")
+    region_valid = region_mask & valid
+    n_pixels     = int(region_valid.sum().item())
+    n_region     = int(region_mask.sum().item())
+    print(f"  지정 영역 유효 픽셀: {n_pixels} / {n_region}")
     if n_pixels < 10:
-        raise RuntimeError("bbox 내 유효 픽셀이 너무 적습니다. bbox 좌표를 확인하세요.")
+        raise RuntimeError("지정 영역 내 유효 픽셀이 너무 적습니다. 좌표를 확인하세요.")
 
-    # normal: bbox 평균
-    n_map       = F.normalize(normal_map, dim=0)          # (3,H,W)
-    n_in_bbox   = n_map[:, bbox_valid]                    # (3,N)
-    plane_normal = F.normalize(n_in_bbox.mean(1), dim=0)  # (3,)
+    # normal: 영역 평균
+    n_map        = F.normalize(normal_map, dim=0)         # (3,H,W)
+    n_in_region  = n_map[:, region_valid]                 # (3,N)
+    plane_normal = F.normalize(n_in_region.mean(1), dim=0)
 
     # normal이 카메라를 향하도록
     cam_dir = F.normalize(cam.camera_center - plane_normal, dim=0)
     if (plane_normal * cam_dir).sum() < 0:
         plane_normal = -plane_normal
 
-    # center: bbox centroid 역투영
-    ys_b, xs_b   = torch.where(bbox_valid)
-    cluster_depth = depth_map[0][bbox_valid].median()
+    # center: 영역 centroid 역투영
+    ys_b, xs_b    = torch.where(region_valid)
+    cluster_depth = depth_map[0][region_valid].median()
     center_2d     = torch.tensor(
         [xs_b.float().mean(), ys_b.float().mean()],
         dtype=torch.float32, device=device,
     )
     plane_center = backproject_pixel_to_world(center_2d, cluster_depth, cam)
 
-    # 법선 일관성 확인 (bbox 내 angular std)
-    cos_vals  = (n_in_bbox.T * plane_normal).sum(-1)       # (N,)
-    ang_std   = torch.acos(cos_vals.clamp(-1, 1)).std().item() * 180 / math.pi
+    # 법선 일관성 확인
+    cos_vals = (n_in_region.T * plane_normal).sum(-1)
+    ang_std  = torch.acos(cos_vals.clamp(-1, 1)).std().item() * 180 / math.pi
     print(f"  normal consistency (std): {ang_std:.1f}°  "
           f"{'✓ 평면적' if ang_std < 15 else '△ 노이즈 있음'}")
     print(f"  plane_normal: {plane_normal.cpu().numpy().round(3)}")
     print(f"  plane_center: {plane_center.cpu().numpy().round(3)}")
 
-    # 디버그 이미지 저장 (bbox overlay)
+    # 디버그 이미지 저장 (폴리곤 overlay)
     if save_debug_img is not None:
-        from PIL import Image
         img = pkg["render"].detach().permute(1, 2, 0).cpu().numpy()
         img = (img * 255).clip(0, 255).astype(np.uint8).copy()
-        # bbox 테두리 그리기 (빨간색)
-        img[y1:y2, x1:x1+3]   = [255, 0, 0]
-        img[y1:y2, x2-3:x2]   = [255, 0, 0]
-        img[y1:y1+3, x1:x2]   = [255, 0, 0]
-        img[y2-3:y2, x1:x2]   = [255, 0, 0]
-        Image.fromarray(img).save(save_debug_img)
+        # 폴리곤 테두리 빨간색으로 그리기
+        overlay      = Image.fromarray(img)
+        draw_overlay = ImageDraw.Draw(overlay)
+        draw_overlay.polygon(bbox, outline=(255, 0, 0))
+        overlay.save(save_debug_img)
         print(f"  디버그 이미지 저장: {save_debug_img}")
 
     return plane_normal, plane_center
@@ -172,9 +173,12 @@ if __name__ == "__main__":
     parser.add_argument("--iteration",  default=-1,   type=int)
     parser.add_argument("--cam_idx",    required=True, type=int,
                         help="기준 카메라 index (train split 기준)")
-    parser.add_argument("--bbox",       required=True, nargs=4, type=int,
+    parser.add_argument("--bbox", nargs=4, type=int,
                         metavar=("X1", "Y1", "X2", "Y2"),
-                        help="태블릿 픽셀 bbox (left top right bottom)")
+                        help="직사각형 영역 (left top right bottom)")
+    parser.add_argument("--poly", nargs=8, type=int,
+                        metavar=("X1","Y1","X2","Y2","X3","Y3","X4","Y4"),
+                        help="비정형 사각형 4꼭짓점 (좌상→우상→우하→좌하 순, 8개 값)")
     parser.add_argument("--dist_thresh", default=0.05, type=float,
                         help="평면 거리 허용 오차 (world unit). 너무 크면 과탐지.")
     parser.add_argument("--normal_deg",  default=20.0, type=float,
@@ -195,8 +199,21 @@ if __name__ == "__main__":
     train_cams = scene.getTrainCameras()
     test_cams  = scene.getTestCameras()
 
-    bbox       = getattr(args, 'bbox',       None)
     cam_idx    = getattr(args, 'cam_idx',    0)
+
+    # --poly 우선, 없으면 --bbox → PIL polygon 꼭짓점 리스트로 통일
+    raw_poly = getattr(args, 'poly', None)
+    raw_bbox = getattr(args, 'bbox', None)
+    if raw_poly is not None:
+        # 8개 값 → [(x1,y1),(x2,y2),(x3,y3),(x4,y4)]
+        xs = raw_poly[0::2]
+        ys = raw_poly[1::2]
+        bbox = list(zip(xs, ys))
+    elif raw_bbox is not None:
+        x1, y1, x2, y2 = raw_bbox
+        bbox = [(x1,y1),(x2,y1),(x2,y2),(x1,y2)]   # 직사각형
+    else:
+        raise ValueError("--bbox 또는 --poly 중 하나는 반드시 지정해야 합니다.")
     dist_thresh = getattr(args, 'dist_thresh', 0.05)
     normal_deg  = getattr(args, 'normal_deg',  20.0)
     split       = getattr(args, 'split',      'train')
