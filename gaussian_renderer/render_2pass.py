@@ -4,6 +4,66 @@ import torch.nn.functional as F
 
 from utils.planar_utils import compute_virtual_camera_reflected
 
+
+def _reflection_warp(img_virtual, virtual_cam, xyz_map, normal_map, plane_mask, cam_center):
+    """
+    Per-pixel reflection re-projection.
+
+    각 태블릿 픽셀 (u,v)에서:
+      1. 3D point P, 법선 N, 카메라 방향 v_dir 계산
+      2. 반사 방향 d_refl = v_dir - 2*(v_dir·N)*N
+      3. d_refl을 가상 카메라 공간으로 변환 → 픽셀 좌표 (u', v')
+      4. img_virtual에서 (u', v') grid_sample → 원본 (u,v)에 합성
+
+    Args:
+        img_virtual : (3, H, W) 가상 카메라 렌더
+        virtual_cam : 가상 카메라 객체 (world_view_transform, FoVx, FoVy)
+        xyz_map     : (3, H, W) world-space 3D positions
+        normal_map  : (3, H, W) world-space normals
+        plane_mask  : (H, W) bool — 태블릿 영역
+        cam_center  : (3,) 원본 카메라 위치
+    Returns:
+        warped: (3, H, W) — plane_mask 영역에만 반사 색상
+    """
+    device = img_virtual.device
+    _, H, W = img_virtual.shape
+
+    P     = xyz_map.permute(1, 2, 0)                           # (H, W, 3)
+    N     = F.normalize(normal_map.permute(1, 2, 0), dim=-1)   # (H, W, 3)
+    v_dir = F.normalize(cam_center.view(1, 1, 3) - P, dim=-1)  # (H, W, 3)
+
+    # 반사 방향: d_refl = v_dir - 2*(v_dir·N)*N
+    dot_vn = (v_dir * N).sum(dim=-1, keepdim=True)             # (H, W, 1)
+    d_refl = F.normalize(v_dir - 2 * dot_vn * N, dim=-1)       # (H, W, 3)
+
+    # world → 가상 카메라 좌표 변환 (방향 벡터)
+    # world_view_transform[:3,:3] = C2W_R → .T = W2C_R
+    W2C_R = virtual_cam.world_view_transform[:3, :3].T          # (3, 3)
+    d_cam = (W2C_R @ d_refl.reshape(-1, 3).T).T.reshape(H, W, 3)  # (H, W, 3)
+
+    # Pinhole projection → 픽셀 좌표 (u', v')
+    focal_x = W / (2.0 * math.tan(virtual_cam.FoVx / 2.0))
+    focal_y = H / (2.0 * math.tan(virtual_cam.FoVy / 2.0))
+
+    d_z     = d_cam[..., 2].clamp(min=1e-6)
+    u_prime = d_cam[..., 0] / d_z * focal_x + W / 2.0          # (H, W)
+    v_prime = d_cam[..., 1] / d_z * focal_y + H / 2.0          # (H, W)
+
+    # NDC [-1, 1] for grid_sample
+    u_ndc = (u_prime / (W - 1)) * 2.0 - 1.0
+    v_ndc = (v_prime / (H - 1)) * 2.0 - 1.0
+    grid  = torch.stack([u_ndc, v_ndc], dim=-1).unsqueeze(0)   # (1, H, W, 2)
+
+    # 가상 카메라 이미지에서 반사 방향에 대응하는 픽셀 샘플링
+    warped = F.grid_sample(
+        img_virtual.unsqueeze(0), grid,
+        mode='bilinear', padding_mode='zeros', align_corners=False,
+    ).squeeze(0)  # (3, H, W)
+
+    # 가상 카메라 뒤를 향하는 반사 방향 (d_cam.z <= 0) 및 마스크 외부 제거
+    valid = (d_cam[..., 2] > 0) & plane_mask                   # (H, W)
+    return warped * valid.float().unsqueeze(0)
+
 try:
     from utils import brdf_utils as brdf
 except Exception:
@@ -38,7 +98,7 @@ def _reconstruct_xyz_map(viewpoint_camera, surf_depth):
     ones  = torch.ones_like(depth)
 
     pts_cam = torch.stack([x_cam, y_cam, depth, ones], dim=0)  # (4, H, W)
-    c2w = torch.inverse(viewpoint_camera.world_view_transform)  # (4, 4)
+    c2w = torch.inverse(viewpoint_camera.world_view_transform.T)  # C2W = W2C^{-1}
     pts_world = (c2w @ pts_cam.reshape(4, -1)).reshape(4, H, W)
 
     xyz_map = pts_world[:3]  # (3, H, W)
@@ -107,6 +167,11 @@ def render_2pass(
     specular_mask_accum = torch.zeros(1, H, W, device=device)
     plane_results = []
 
+    # xyz_map은 모든 plane에서 공통 — loop 밖에서 한 번만 계산
+    _surf_depth_pre  = render_pkg_base.get("surf_depth",  None)
+    _normal_map_pre  = render_pkg_base.get("rend_normal", None)
+    _xyz_map_pre     = _reconstruct_xyz_map(viewpoint_camera, _surf_depth_pre) if _surf_depth_pre is not None else None
+
     for group in planar_groups:
         plane_mask   = group["mask"]           # (H, W)
         plane_normal = group["dominant_normal"] # (3,)
@@ -123,18 +188,30 @@ def render_2pass(
             virtual_camera, pc, pipe, bg_color,
             scaling_modifier=scaling_modifier,
         )
-        img_virtual     = render_pkg_virtual["render"]
-        plane_mask_3d   = plane_mask.unsqueeze(0).float()  # (1, H, W)
+        img_virtual   = render_pkg_virtual["render"]
+        plane_mask_3d = plane_mask.unsqueeze(0).float()  # (1, H, W)
+
+        # Per-pixel reflection re-projection (정확한 warp)
+        if _xyz_map_pre is not None and _normal_map_pre is not None:
+            warped = _reflection_warp(
+                img_virtual, virtual_camera,
+                _xyz_map_pre, _normal_map_pre,
+                plane_mask, viewpoint_camera.camera_center,
+            )
+        else:
+            # fallback: xyz/normal 없으면 기존 단순 crop 방식
+            warped = img_virtual * plane_mask_3d
 
         plane_results.append({
-            "mask":    plane_mask_3d,
-            "specular": img_virtual,
-            "normal":  plane_normal,
-            "center":  plane_center,
+            "mask":     plane_mask_3d,
+            "specular": img_virtual,   # raw 가상 카메라 렌더 (저장용)
+            "warped":   warped,        # warp된 반사 (합성용)
+            "normal":   plane_normal,
+            "center":   plane_center,
         })
 
-        img_specular_accum   += img_virtual * plane_mask_3d
-        specular_mask_accum  += plane_mask_3d
+        img_specular_accum  += warped
+        specular_mask_accum += plane_mask_3d
 
     # Normalize specular by overlap count so overlapping planes don't over-accumulate
     overlap_count = specular_mask_accum.clamp(min=1.0)
@@ -161,7 +238,7 @@ def render_2pass(
 
     if normal_map is not None and surf_depth is not None:
         n = F.normalize(normal_map, dim=0)  # (3, H, W)
-        xyz_map = _reconstruct_xyz_map(viewpoint_camera, surf_depth)
+        xyz_map = _xyz_map_pre  # 이미 계산된 값 재사용
         cam_center = viewpoint_camera.camera_center.view(3, 1, 1)
         v = F.normalize(cam_center - xyz_map, dim=0)
         cos_theta = (n * v).sum(0, keepdim=True).clamp(0, 1)  # (1, H, W)

@@ -100,10 +100,17 @@ def compute_virtual_camera_reflected(camera, plane_normal, plane_center):
     plane_normal = F.normalize(plane_normal.to(device), dim=0)
     plane_center = plane_center.to(device)
 
-    d_in = F.normalize(plane_center - camera.camera_center, dim=0)
+    C = camera.camera_center  # (3,)
+
+    # 실제 카메라를 평면 기준으로 대칭 이동 → 가상 카메라 위치
+    dist_to_plane = torch.dot(C - plane_center, plane_normal)
+    C_prime = C - 2 * dist_to_plane * plane_normal
+
+    # 시선 방향: C→plane_center 벡터를 평면에서 반사
+    d_in = F.normalize(plane_center - C, dim=0)
     d_refl = F.normalize(d_in - 2 * torch.dot(d_in, plane_normal) * plane_normal, dim=0)
 
-    forward = d_refl
+    forward = -d_refl   # R_cam_to_world[:,2] = -forward → 카메라는 -forward 방향을 봄
     if torch.abs(forward[1]) < 0.9:
         up_world = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=torch.float32)
     else:
@@ -115,7 +122,7 @@ def compute_virtual_camera_reflected(camera, plane_normal, plane_center):
     # world → camera: rows = [right, up, -forward]
     R_world_to_cam = torch.stack([right, up, -forward], dim=0)  # (3, 3)
     R_cam_to_world = R_world_to_cam.T
-    T = -R_world_to_cam @ plane_center
+    T = -R_world_to_cam @ plane_center  # 가상 카메라 위치 = 평면 중심
 
     virtual_cam = Camera(
         colmap_id=-1,
@@ -190,7 +197,7 @@ def backproject_pixel_to_world(pixel_xy, depth, camera):
 
     point_cam = torch.stack([x_cam, y_cam, z_cam,
                               torch.ones_like(z_cam)], dim=0).float()
-    world_view_inv = torch.inverse(camera.world_view_transform)
+    world_view_inv = torch.inverse(camera.world_view_transform.T)  # C2W = W2C^{-1}
     return (world_view_inv @ point_cam)[:3]
 
 

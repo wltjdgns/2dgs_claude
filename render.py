@@ -84,20 +84,61 @@ if __name__ == "__main__":
         print(f"[SAM] loaded {sam_model_type} from {sam_ckpt}")
 
     # ── Load planar cache (custom path → default planar_cache.pt) ──
+    # v1 (legacy): {cam_name: [{"mask": ..., "dominant_normal": ..., "center": ...}]}
+    # v2 (gaussian-based): {"version": 2, "gaussian_indices": ..., "dominant_normal": ..., "center": ...}
     planar_cache = None
+    planar_meta  = None
     if enable_2pass:
         cache_path = getattr(args, 'planar_cache_path', None) or \
                      os.path.join(args.model_path, "planar_cache.pt")
         if os.path.exists(cache_path):
             raw_cache = torch.load(cache_path, map_location="cpu")
-            planar_cache = {
-                cam_name: [
-                    {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in g.items()}
-                    for g in groups
-                ]
-                for cam_name, groups in raw_cache.items()
-            }
-            print(f"[Planar] loaded cache ({len(planar_cache)} cameras) from {cache_path}")
+            if isinstance(raw_cache, dict) and raw_cache.get("version") == 3:
+                planar_meta = {
+                    "version":            3,
+                    "polygon_corners_3d": raw_cache["polygon_corners_3d"].cuda(),
+                    "dominant_normal":    raw_cache["dominant_normal"].cuda(),
+                    "center":             raw_cache["center"].cuda(),
+                }
+                print(f"[Planar V3] polygon-projection cache from {cache_path}")
+            elif isinstance(raw_cache, dict) and raw_cache.get("version") == 2:
+                planar_meta = {
+                    "version":          2,
+                    "gaussian_indices": raw_cache["gaussian_indices"].cuda(),
+                    "dominant_normal":  raw_cache["dominant_normal"].cuda(),
+                    "center":           raw_cache["center"].cuda(),
+                }
+                print(f"[Planar V2] gaussian-based cache: "
+                      f"{len(planar_meta['gaussian_indices'])} gaussians from {cache_path}")
+            else:
+                planar_cache = {
+                    cam_name: [
+                        {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in g.items()}
+                        for g in groups
+                    ]
+                    for cam_name, groups in raw_cache.items()
+                }
+                print(f"[Planar V1] loaded cache ({len(planar_cache)} cameras) from {cache_path}")
+
+    def _project_polygon_mask(corners_3d, cam):
+        """(4,3) world corners → (H,W) bool mask by projecting polygon onto camera."""
+        import math as _math
+        from PIL import Image as _Image, ImageDraw as _ImageDraw
+        device = corners_3d.device
+        N = corners_3d.shape[0]
+        H, W = cam.image_height, cam.image_width
+        ones = torch.ones(N, 1, device=device)
+        pts_cam = (cam.world_view_transform.T @ torch.cat([corners_3d, ones], -1).T)[:3].T
+        if (pts_cam[:, 2] < 0.01).any():
+            return None
+        fx = W / (2 * _math.tan(cam.FoVx / 2))
+        fy = H / (2 * _math.tan(cam.FoVy / 2))
+        u = (pts_cam[:, 0] / pts_cam[:, 2] * fx + W / 2).cpu()
+        v = (pts_cam[:, 1] / pts_cam[:, 2] * fy + H / 2).cpu()
+        poly = [(float(u[i]), float(v[i])) for i in range(N)]
+        img = _Image.new("L", (W, H), 0)
+        _ImageDraw.Draw(img).polygon(poly, fill=255)
+        return torch.from_numpy(__import__('numpy').array(img) > 0).to(device)
 
     def render_func(cam, gs, pipe_, bg, scaling_modifier=1.0, override_color=None):
         return render(cam, gs, pipe_, bg, scaling_modifier=scaling_modifier, override_color=override_color)
@@ -112,11 +153,10 @@ if __name__ == "__main__":
 
         from utils.planar_utils import detect_planar_groups_from_depth_fast
         from gaussian_renderer.render_2pass import render_2pass
+        onepass_path    = os.path.join(out_dir, "vis", "1pass")
         twopass_path    = os.path.join(out_dir, "vis", "2pass")
-        planar_path     = os.path.join(out_dir, "vis", "planar_mask")
         metal_path      = os.path.join(out_dir, "vis", "metal")
-        f0_path         = os.path.join(out_dir, "vis", "f0")
-        for p in [twopass_path, planar_path, metal_path, f0_path]:
+        for p in [onepass_path, twopass_path, metal_path]:
             os.makedirs(p, exist_ok=True)
 
         for idx, cam in tqdm(enumerate(cameras), desc="PBR / 2-pass export"):
@@ -133,14 +173,43 @@ if __name__ == "__main__":
                                 os.path.join(metal_path, f'{stem}.png'))
                     f0 = metalprob_to_f0_rgb(base_pkg, metal_map)
                     if f0 is not None:
-                        save_img_u8(f0.detach().permute(1,2,0).cpu().numpy(),
-                                    os.path.join(f0_path, f'{stem}.png'))
                         # f0_map을 base_pkg에 주입 → render_2pass에서 F0로 사용
                         base_pkg["f0_map"] = f0
 
-            # ── Resolve planar groups: cache → SAM → specularity-based (B) ──
+            # ── Resolve planar groups: cache (v2/v1) → SAM → specularity-based (B) ──
             cam_name = getattr(cam, "image_name", f"cam_{idx}")
-            if planar_cache is not None:
+            if planar_meta is not None and planar_meta.get("version") == 3:
+                # v3: 3D 꼭짓점 투영 → 정확한 폴리곤 마스크
+                mask_2d = _project_polygon_mask(
+                    planar_meta["polygon_corners_3d"], cam
+                )
+                if mask_2d is not None and mask_2d.sum() > 100:
+                    planar_groups = [{
+                        "mask":            mask_2d,
+                        "dominant_normal": planar_meta["dominant_normal"],
+                        "center":          planar_meta["center"],
+                    }]
+                else:
+                    planar_groups = []
+            elif planar_meta is not None and planar_meta.get("version") == 2:
+                # v2: 평면 가우시안만 white로 부분 렌더 → mask
+                N_g = gaussians.get_xyz.shape[0]
+                override = torch.zeros(N_g, 3, device='cuda')
+                override[planar_meta['gaussian_indices']] = 1.0
+                with torch.no_grad():
+                    mask_pkg = render(cam, gaussians, pipe,
+                                      torch.zeros(3, device='cuda'),
+                                      override_color=override)
+                mask_2d = (mask_pkg["render"][0] > 0.1)
+                if mask_2d.sum() > 100:
+                    planar_groups = [{
+                        "mask":            mask_2d,
+                        "dominant_normal": planar_meta["dominant_normal"],
+                        "center":          planar_meta["center"],
+                    }]
+                else:
+                    planar_groups = []
+            elif planar_cache is not None:
                 planar_groups = planar_cache.get(cam_name, [])
             elif sam_generator is not None:
                 planar_groups = detect_planar_groups_from_depth_fast(
@@ -167,13 +236,25 @@ if __name__ == "__main__":
                     metal_map=metal_map,
                     render_pkg_base=base_pkg,
                 )
+                # vis/1pass: base Gaussian render (비교용) — base_pkg에서 직접 참조
+                save_img_u8(base_pkg['render'].detach().permute(1,2,0).cpu().numpy(),
+                            os.path.join(onepass_path, f'{stem}.png'))
+                # vis/2pass: 가상 카메라 렌더 (planar 탐지 영역만 마스킹된 반사 이미지)
                 if 'pass2' in pkg:
                     save_img_u8(pkg['pass2'].detach().permute(1,2,0).cpu().numpy(),
                                 os.path.join(twopass_path, f'{stem}.png'))
-                if 'specular_mask' in pkg:
-                    m = pkg['specular_mask'].detach().expand(3,-1,-1)
-                    save_img_u8(m.permute(1,2,0).cpu().numpy(),
-                                os.path.join(planar_path, f'{stem}.png'))
+                # vis/2pass_raw: 가상 카메라 raster 원본 (마스킹 전, 확대/방향 디버깅용)
+                if 'plane_results' in pkg and len(pkg['plane_results']) > 0:
+                    twopass_raw_path = os.path.join(out_dir, "vis", "2pass_raw")
+                    os.makedirs(twopass_raw_path, exist_ok=True)
+                    for i, pr in enumerate(pkg['plane_results']):
+                        save_img_u8(pr['specular'].detach().permute(1,2,0).cpu().numpy(),
+                                    os.path.join(twopass_raw_path, f'{stem}_p{i}.png'))
+                # renders/: 최종 합성 → PSNR 평가용 (gaussExtractor 기본 렌더 덮어씀)
+                renders_dir = os.path.join(out_dir, 'renders')
+                os.makedirs(renders_dir, exist_ok=True)
+                save_img_u8(pkg['render'].detach().permute(1,2,0).cpu().numpy(),
+                            os.path.join(renders_dir, f'{stem}.png'))
 
     if not args.skip_train:
         print("export training images ...")

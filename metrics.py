@@ -11,6 +11,8 @@
 
 from pathlib import Path
 import os
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 from PIL import Image
 import torch
 import torchvision.transforms.functional as tf
@@ -88,8 +90,10 @@ def evaluate(model_paths, split='test'):
                 json.dump(full_dict[scene_dir], fp, indent=True)
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
-        except:
+        except Exception as e:
+            import traceback
             print("Unable to compute metrics for model", scene_dir)
+            traceback.print_exc()
 
 if __name__ == "__main__":
     device = torch.device("cuda:0")

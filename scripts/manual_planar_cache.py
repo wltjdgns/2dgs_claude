@@ -50,12 +50,71 @@ def reconstruct_xyz_map(cam, surf_depth):
     ones  = torch.ones_like(depth)
 
     pts_cam   = torch.stack([x_cam, y_cam, depth, ones], dim=0)  # (4,H,W)
-    c2w       = torch.inverse(cam.world_view_transform)           # (4,4)
+    c2w       = torch.inverse(cam.world_view_transform.T)          # C2W = (W2C.T).T.inv = W2C.inv
     pts_world = (c2w @ pts_cam.reshape(4, -1)).reshape(4, H, W)
     return pts_world[:3] * (depth > 0.01).unsqueeze(0).float()   # (3,H,W)
 
 
-# ── 3D 평면을 카메라 뷰에 투영 → 마스크 생성 ─────────────────────────────────
+# ── 폴리곤 안 + 평면 위 가우시안 인덱스 추출 ──────────────────────────────────
+def extract_gaussians_in_polygon(gaussians, ref_cam, region_mask,
+                                  plane_normal, plane_center, dist_thresh):
+    """
+    기준 카메라 시점에서 (a) 폴리곤 영역에 투영되고
+    (b) 평면까지 거리 < dist_thresh 인 가우시안 인덱스 반환.
+
+    Args:
+        gaussians:     GaussianModel
+        ref_cam:       기준 카메라
+        region_mask:   (H, W) bool — 폴리곤 영역
+        plane_normal:  (3,) world
+        plane_center:  (3,) world
+        dist_thresh:   float — 평면까지 거리 한계 (world unit)
+
+    Returns:
+        indices: (K,) long — 선택된 가우시안 인덱스
+    """
+    xyz    = gaussians.get_xyz                       # (N, 3) world
+    device = xyz.device
+    N      = xyz.shape[0]
+    H, W   = region_mask.shape
+
+    # (a) 평면까지 거리 필터
+    diff       = xyz - plane_center.to(device).view(1, 3)
+    dist       = (diff * plane_normal.to(device).view(1, 3)).sum(-1).abs()  # (N,)
+    near_plane = dist < dist_thresh
+
+    # (b) world → camera: W2C @ pts_col = world_view_transform.T @ pts_col
+    ones        = torch.ones(N, 1, device=device)
+    pts_world_h = torch.cat([xyz, ones], dim=-1).T        # (4, N)
+    pts_cam_h   = ref_cam.world_view_transform.T @ pts_world_h  # (4, N)
+    pts_cam     = pts_cam_h[:3, :].T                       # (N, 3)
+
+    in_front = pts_cam[:, 2] > 0.01
+
+    # camera → image (pinhole, same convention as reconstruct_xyz_map)
+    fx = ref_cam.image_width  / (2 * math.tan(ref_cam.FoVx / 2))
+    fy = ref_cam.image_height / (2 * math.tan(ref_cam.FoVy / 2))
+
+    z_safe = pts_cam[:, 2].clamp(min=0.01)
+    u      = pts_cam[:, 0] / z_safe * fx + W / 2
+    v      = pts_cam[:, 1] / z_safe * fy + H / 2
+
+    in_image = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+
+    u_int = u.round().long().clamp(0, W - 1)
+    v_int = v.round().long().clamp(0, H - 1)
+
+    in_polygon = torch.zeros(N, dtype=torch.bool, device=device)
+    valid_idx  = in_front & in_image
+    in_polygon[valid_idx] = region_mask[v_int[valid_idx], u_int[valid_idx]]
+
+    selected = near_plane & in_front & in_polygon
+    print(f"  가우시안 필터링: total={N}  near_plane={int(near_plane.sum())}  "
+          f"in_polygon={int(in_polygon.sum())}  selected={int(selected.sum())}")
+    return torch.where(selected)[0]
+
+
+# ── 3D 평면을 카메라 뷰에 투영 → 마스크 생성 (v1 레거시) ─────────────────────
 def project_plane_to_mask(cam, pkg, plane_normal, plane_center,
                            dist_thresh: float, normal_deg: float):
     """
@@ -124,17 +183,25 @@ def extract_plane_from_bbox(cam, pkg, bbox, save_debug_img=None):
     if n_pixels < 10:
         raise RuntimeError("지정 영역 내 유효 픽셀이 너무 적습니다. 좌표를 확인하세요.")
 
-    # normal: 영역 평균
-    n_map        = F.normalize(normal_map, dim=0)         # (3,H,W)
-    n_in_region  = n_map[:, region_valid]                 # (3,N)
-    plane_normal = F.normalize(n_in_region.mean(1), dim=0)
+    # normal: 최빈값 (구면 좌표 bin → 가장 많은 bin의 평균)
+    n_map       = F.normalize(normal_map, dim=0)          # (3,H,W)
+    n_in_region = n_map[:, region_valid]                  # (3,N)
 
-    # normal이 카메라를 향하도록
-    cam_dir = F.normalize(cam.camera_center - plane_normal, dim=0)
-    if (plane_normal * cam_dir).sum() < 0:
-        plane_normal = -plane_normal
+    BIN_DEG = 5                                           # 5° 단위로 양자화
+    nz       = n_in_region[2].clamp(-1, 1)
+    nx, ny   = n_in_region[0], n_in_region[1]
+    theta_bin = (torch.acos(nz)                    * 180 / math.pi / BIN_DEG).long()
+    phi_bin   = ((torch.atan2(ny, nx) * 180 / math.pi + 360) % 360 / BIN_DEG).long()
+    bin_idx   = theta_bin * 1000 + phi_bin          # 유일한 bin ID
 
-    # center: 영역 centroid 역투영
+    counts    = torch.bincount(bin_idx.clamp(min=0))
+    mode_bin  = counts.argmax().item()
+    mode_mask = (bin_idx == mode_bin)
+    plane_normal = F.normalize(n_in_region[:, mode_mask].mean(1), dim=0)
+    print(f"  mode bin 픽셀: {int(mode_mask.sum())} / {n_in_region.shape[1]}"
+          f"  ({int(mode_mask.sum()) / n_in_region.shape[1] * 100:.1f}%)")
+
+    # center: 영역 centroid 역투영 (cam_dir 계산보다 먼저)
     ys_b, xs_b    = torch.where(region_valid)
     cluster_depth = depth_map[0][region_valid].median()
     center_2d     = torch.tensor(
@@ -142,6 +209,11 @@ def extract_plane_from_bbox(cam, pkg, bbox, save_debug_img=None):
         dtype=torch.float32, device=device,
     )
     plane_center = backproject_pixel_to_world(center_2d, cluster_depth, cam)
+
+    # normal이 카메라를 향하도록 (plane_center 기준)
+    cam_dir = F.normalize(cam.camera_center - plane_center, dim=0)
+    if (plane_normal * cam_dir).sum() < 0:
+        plane_normal = -plane_normal
 
     # 법선 일관성 확인
     cos_vals = (n_in_region.T * plane_normal).sum(-1)
@@ -151,16 +223,57 @@ def extract_plane_from_bbox(cam, pkg, bbox, save_debug_img=None):
     print(f"  plane_normal: {plane_normal.cpu().numpy().round(3)}")
     print(f"  plane_center: {plane_center.cpu().numpy().round(3)}")
 
-    # 디버그 이미지 저장 (폴리곤 overlay)
+    # 디버그 이미지 저장 (폴리곤 + normal 방향 + center 시각화)
     if save_debug_img is not None:
         img = pkg["render"].detach().permute(1, 2, 0).cpu().numpy()
         img = (img * 255).clip(0, 255).astype(np.uint8).copy()
-        # 폴리곤 테두리 빨간색으로 그리기
         overlay      = Image.fromarray(img)
         draw_overlay = ImageDraw.Draw(overlay)
+
+        # 폴리곤 테두리 (빨간색)
         draw_overlay.polygon(bbox, outline=(255, 0, 0))
+
+        # plane_center를 이미지에 투영 → 파란 점
+        device = depth_map.device
+        cx = torch.tensor([xs_b.float().mean().item()], device=device)
+        cy = torch.tensor([ys_b.float().mean().item()], device=device)
+        cx_i, cy_i = int(cx.item()), int(cy.item())
+        r = 6
+        draw_overlay.ellipse([cx_i - r, cy_i - r, cx_i + r, cy_i + r], fill=(0, 0, 255))
+
+        # world_view_transform = W2C.T → [:3,:3] = C2W_R → .T = W2C_R
+        W2C_R = cam.world_view_transform[:3, :3].T     # (3,3) world→cam rotation
+
+        def _proj_arrow(d_world, color, label, start_xy, arrow_len=70, arriving=False):
+            """world 방향 벡터를 카메라 접선면에 투영해 화살표 그리기"""
+            d_cam = W2C_R @ d_world.to(device)         # (3,) camera space
+            dx = int(d_cam[0].item() * arrow_len)
+            dy = int(d_cam[1].item() * arrow_len)      # 이미지 y = cam y (동일 방향)
+            sx, sy = start_xy
+            if arriving:                                # 화살표가 start_xy로 도달
+                ex, ey = sx, sy
+                sx, sy = sx - dx, sy - dy
+            else:                                       # 화살표가 start_xy에서 출발
+                ex, ey = sx + dx, sy + dy
+            draw_overlay.line([sx, sy, ex, ey], fill=color, width=3)
+            draw_overlay.ellipse([ex-4, ey-4, ex+4, ey+4], fill=color)
+
+        arrow_len = 70
+        # 초록: plane_normal
+        n_world = plane_normal.to(device)
+        _proj_arrow(n_world, (0,255,0), "normal", (cx_i, cy_i), arrow_len)
+
+        # 노랑: input 방향 (카메라 → center, arriving 화살표)
+        d_in  = F.normalize(plane_center - cam.camera_center, dim=0)
+        _proj_arrow(d_in, (255,255,0), "input", (cx_i, cy_i), arrow_len, arriving=True)
+
+        # 청록: output/반사 방향 (center에서 d_refl 방향으로 출발)
+        d_refl = F.normalize(d_in - 2 * torch.dot(d_in, plane_normal.to(device)) * plane_normal.to(device), dim=0)
+        _proj_arrow(d_refl, (0,255,255), "refl", (cx_i, cy_i), arrow_len)
+
         overlay.save(save_debug_img)
         print(f"  디버그 이미지 저장: {save_debug_img}")
+        print(f"    (빨강=폴리곤  파랑●=center  초록→=normal  노랑→=input  청록→=반사방향)")
 
     return plane_normal, plane_center
 
@@ -188,7 +301,7 @@ if __name__ == "__main__":
     parser.add_argument("--out_name",   default="planar_cache_manual.pt", type=str)
     args = get_combined_args(parser)
 
-    safe_state(True)
+    safe_state(False)
 
     dataset   = model.extract(args)
     pipe      = pipeline.extract(args)
@@ -232,61 +345,38 @@ if __name__ == "__main__":
         ref_cam, ref_pkg, bbox, save_debug_img=debug_path
     )
 
-    # ── Step 2: 전체 카메라에 평면 투영 → 마스크 생성 ─────────────────────
-    splits = []
-    if split in ("train", "both"):
-        splits.append(("train", train_cams))
-    if split in ("test", "both"):
-        splits.append(("test",  test_cams))
+    # ── Step 2: 폴리곤 꼭짓점 4개를 3D로 역투영 ──────────────────────────────
+    depth_map = ref_pkg["surf_depth"][0]           # (H, W)
+    H, W = depth_map.shape
+    polygon_corners_3d = []
+    cluster_depth = depth_map[depth_map > 0.01].median()
 
-    cache: dict = {}
-    n_detected  = 0
+    for (u, v) in bbox:
+        u_c = min(max(int(round(u)), 0), W - 1)
+        v_c = min(max(int(round(v)), 0), H - 1)
+        d = depth_map[v_c, u_c]
+        if d < 0.01:
+            d = cluster_depth           # 유효 depth 없으면 평균 depth 사용
+        corner_3d = backproject_pixel_to_world(
+            torch.tensor([float(u), float(v)], device="cuda"), d.cuda(), ref_cam
+        )
+        polygon_corners_3d.append(corner_3d.cpu())
 
-    for split_name, cameras in splits:
-        print(f"\n[manual_planar_cache] {split_name} split ({len(cameras)} cameras) "
-              f"dist_thresh={dist_thresh}  normal_deg={normal_deg}°")
+    corners_tensor = torch.stack(polygon_corners_3d)   # (4, 3)
+    print(f"  3D 폴리곤 꼭짓점:\n{corners_tensor.numpy().round(3)}")
 
-        for idx, cam in enumerate(tqdm(cameras, desc=split_name)):
-            cam_name = getattr(cam, "image_name", f"cam_{idx}")
-
-            with torch.no_grad():
-                pkg = render(cam, gaussians, pipe, bg)
-
-            mask = project_plane_to_mask(
-                cam, pkg, plane_normal, plane_center,
-                dist_thresh=dist_thresh,
-                normal_deg=normal_deg,
-            )
-
-            if mask is not None and mask.sum() > 100:
-                depth_map    = pkg["surf_depth"]
-                cluster_depth = float(depth_map[0][mask].median().item())
-                ys_m, xs_m   = torch.where(mask)
-                center_2d    = torch.tensor(
-                    [xs_m.float().mean(), ys_m.float().mean()],
-                    dtype=torch.float32, device=mask.device,
-                )
-                center_3d = backproject_pixel_to_world(
-                    center_2d, torch.tensor(cluster_depth, device=mask.device), cam
-                )
-                cache[cam_name] = [{
-                    "mask":            mask.cpu(),
-                    "dominant_normal": plane_normal.cpu(),
-                    "mean_depth":      cluster_depth,
-                    "center":          center_3d.cpu(),
-                }]
-                n_detected += 1
-            else:
-                cache[cam_name] = []   # 이 뷰에서는 평면 안 보임
-
-    # ── Step 3: 저장 ───────────────────────────────────────────────────────
+    # ── Step 3: v3 포맷으로 저장 ───────────────────────────────────────────
+    cache = {
+        "version":            3,
+        "polygon_corners_3d": corners_tensor,
+        "dominant_normal":    plane_normal.cpu(),
+        "center":             plane_center.cpu(),
+    }
     out_path = os.path.join(args.model_path, out_name)
     torch.save(cache, out_path)
 
-    print(f"\n[manual_planar_cache] 완료")
-    print(f"  평면 탐지된 카메라: {n_detected} / {len(cache)}")
+    print(f"\n[manual_planar_cache] 완료 (v3: polygon-projection)")
     print(f"  저장 → {out_path}")
     print(f"  디버그 이미지 → {debug_path}")
     print(f"\n  다음 단계:")
-    print(f"    python render.py -m {args.model_path} --enable_2pass "
-          f"--planar_cache_path {out_path}")
+    print(f"    python render.py -m {args.model_path} --enable_2pass --planar_cache_path {out_path}")
